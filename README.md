@@ -1,18 +1,38 @@
 # Ycode
 
-一个用 TypeScript 和 Bun 编写的精简编程代理框架。第一版是只读的终端助手：你在一个项目目录里提问，模型可以列目录、读取文本文件，再根据内容回答。
+一个用 TypeScript 和 Bun 编写的小型个人 Agent 框架。你在同一个终端里可以来回处理几件事，Ycode 会把消息接到对应的任务。
 
 ## 运行
 
-需要 [Bun](https://bun.sh/) 和一个正在运行的 [Ollama](https://ollama.com/) 服务。默认使用支持工具调用的 `qwen3:4b`。
+默认调用本机已登录的 [Codex CLI](https://learn.chatgpt.com/docs/non-interactive-mode)，也可以使用 ChatGPT 桌面应用自带的 CLI。直接运行编译好的可执行文件：
 
 ```sh
-ollama pull qwen3:4b
-bun install
-bun start "读一下 src/agent.ts，解释代理什么时候结束一次任务。"
+./dist/ycode --edit
 ```
 
-模型名称可通过 `YCODE_MODEL` 修改。默认服务地址为 `http://127.0.0.1:11434`。如果用 `YCODE_BASE_URL` 指向其他 Ollama 服务，问题和被读取的文件内容也会发送给该服务。
+从源码运行需要 [Bun](https://bun.sh/)：
+
+```sh
+bun install
+bun start --edit
+```
+
+例如在同一个窗口，先说「根据 notes.md 写一份周报，保存到 report.md」，再说「找出当前目录最大的三个文件」，最后说「周报的标题再短一点」。加文件和改文件都会先预览，输入 `y` 后写入。
+
+交互模式在当前目录的 `.ycode/tasks/` 保存任务历史和产物。重开 Ycode 可以说「继续改周报」。问候和可以单独回答的问题能在选择任务时一起回答，读取任务历史或使用文件工具时才继续调用模型。如果遇到含糊的指代，Ycode 会问是哪件事，输入 `/cancel` 可以结束这次澄清，输入 `/exit` 退出。
+
+也可以带上一个任务，单次运行：
+
+```sh
+bun start "读一下 src/agent.ts，解释代理什么时候结束一次任务。"
+bun start --edit "把 README 标题下面的项目简介改成一句简短的英文"
+```
+
+`--edit` 允许每轮提议创建一个新文件或对现有文件做一处精确替换。单次命令不使用交互模式的任务记录。
+
+使用 Codex 时，本轮请求、相关任务历史和工具读取到的内容会提交给 Codex。网络可使用 `HTTPS_PROXY`，在 macOS 上也能沿用已启用的系统 HTTPS 代理。
+
+要改用 [Ollama](https://ollama.com/)，运行 `YCODE_PROVIDER=ollama bun start --edit`。Ollama 默认使用 `qwen3:4b` 和 `http://127.0.0.1:11434`。可通过 `YCODE_MODEL` 和 `YCODE_BASE_URL` 修改，单独设置其中一个也会选择 Ollama。
 
 要在其他项目中使用，先运行 `bun run build`，再切换到目标目录并执行：
 
@@ -23,9 +43,12 @@ bun start "读一下 src/agent.ts，解释代理什么时候结束一次任务�
 ## 代码结构
 
 - `src/cli.ts` 处理命令行输入，以当前目录为工作区。
-- `src/agent.ts` 调用模型，把工具结果放回对话，直到模型回答或用完 12 次工具调用额度。
+- `src/assistant.ts` 提供通用入口 `openAssistant(workspace, chat)`。应用调用 `send(text, tools)`，可以传入自己的工具定义和执行函数。
+- `src/tasks.ts` 保存任务。Router 读取最近的任务卡，决定新建、接续或澄清。执行器只收到选中任务的历史。
+- `src/agent.ts` 负责调用模型和工具，直到模型回答或用完 12 次工具调用额度。
+- `src/codex.ts` 调用 `codex exec`，把结构化回复交给 Ycode 处理。
 - `src/ollama.ts` 负责 [Ollama 聊天接口](https://docs.ollama.com/api/chat)。要接其他模型服务，可以实现 `Chat` 接口。
-- `src/tools.ts` 注册工具的说明和执行函数。初始工具为 `list_files` 和 `read_file`，限制访问工作区内的非隐藏路径，跳过 `node_modules`。文本文件上限为 64 KiB。
+- `src/tools.ts` 提供列目录、读文件、创建文件和文本替换。文件工具限定在当前工作区，文本文件上限为 64 KiB。
 
 ## 开发
 
