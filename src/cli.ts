@@ -17,6 +17,12 @@ const instructions = [
   "Propose at most one edit per turn. A proposed edit still needs the user's approval.",
 ].join("\n");
 
+function showStatus(status = "") {
+  if (terminal) process.stdout.write(`\r\x1b[2K${status}`);
+}
+
+const editPrompt = "APPLY THIS EDIT? [Y/N] ";
+
 async function previewEdit(
   tools: ReturnType<typeof workspaceTools>,
   confirm: () => Promise<boolean>,
@@ -42,17 +48,19 @@ async function interact(chat: Chat, root: string) {
   const lines = createInterface({ input: process.stdin, output: process.stdout, terminal });
   const input = lines[Symbol.asyncIterator]();
   try {
-    console.log("Ycode · /exit to quit");
+    console.log("YCODE · /EXIT TO QUIT");
     while (true) {
       if (terminal) {
-        lines.setPrompt("ycode> ");
+        lines.setPrompt("YCODE> ");
         lines.prompt();
       }
       const next = await input.next();
-      if (next.done || next.value.trim() === "/exit") break;
+      if (next.done) break;
       const text = next.value.trim();
+      const command = text.toLowerCase();
+      if (command === "/exit") break;
       if (!text) continue;
-      if (text === "/cancel") {
+      if (command === "/cancel") {
         assistant.cancelClarification();
         continue;
       }
@@ -61,21 +69,26 @@ async function interact(chat: Chat, root: string) {
         const result = await assistant.send(text, tools, {
           instructions,
           onProgress(stage) {
-            if (terminal) console.log(stage === "routing" ? "Checking request…" : "Waiting for model…");
+            showStatus(stage === "routing" ? "ROUTING…" : "WAITING FOR MODEL…");
           },
           async onAnswer(answer, title) {
+            showStatus();
             console.log(`[${title}] ${answer}`);
             return previewEdit(tools, async () => {
               if (!terminal) return false;
-              lines.setPrompt("Apply this edit? [y/N] ");
+              lines.setPrompt(editPrompt);
               lines.prompt();
               const answer = await input.next();
               return !answer.done && answer.value.trim().toLowerCase() === "y";
             });
           },
         });
-        if (result.type === "question") console.log(result.question + " (/cancel to start over)");
+        if (result.type === "question") {
+          showStatus();
+          console.log(result.question + " (/CANCEL TO START OVER)");
+        }
       } catch (err) {
+        showStatus();
         console.error("ycode:", err instanceof Error ? err.message : String(err));
       }
     }
@@ -107,7 +120,7 @@ YCODE_BASE_URL  Ollama server (default: http://127.0.0.1:11434)`);
       const turn = await runTurn(args.join(" "), chat, tools, [], instructions);
       console.log(turn.answer);
       await previewEdit(tools, async () =>
-        terminal && prompt("Apply this edit? [y/N]")?.trim().toLowerCase() === "y");
+        terminal && prompt(editPrompt.trimEnd())?.trim().toLowerCase() === "y");
     }
   } catch (err) {
     console.error("ycode:", err instanceof Error ? err.message : String(err));
