@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { createInterface } from "node:readline";
+import { clearScreenDown, createInterface, cursorTo, moveCursor } from "node:readline";
 import { runTurn, type Chat, type Tools } from "./agent";
 import { openAssistant, type TurnOptions } from "./assistant";
 import { codex } from "./codex";
@@ -10,6 +10,8 @@ const args = process.argv.slice(2);
 const allowEdit = args[0] === "--edit";
 if (allowEdit) args.shift();
 const terminal = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+const animatedTerminal = terminal && process.env.TERM !== "dumb";
+const terminalColor = animatedTerminal && !process.env.NO_COLOR && process.stdout.hasColors();
 
 const instructions = [
   "Use the current directory as the workspace. Cite file paths when relevant.",
@@ -29,6 +31,7 @@ const statusPhrases = {
 type StatusStage = keyof typeof statusPhrases;
 
 const glowStyles = ["1;96", "96", "36", "2;36"] as const;
+const queueAccents = ["1;97", "1;96", "96", "1;36"] as const;
 
 function shimmerLabel(label: string, frame: number) {
   const center = frame % (label.length + 6) - 3;
@@ -46,28 +49,23 @@ function shimmerLabel(label: string, frame: number) {
   return styled + "\x1b[0m";
 }
 
-function createStatus() {
-  const enabled = terminal && process.env.TERM !== "dumb";
-  const color = enabled && !process.env.NO_COLOR && process.stdout.hasColors();
+function createStatus(render: (status: string) => void) {
   const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-  const clearLine = "\r\x1b[2K";
   let timer: ReturnType<typeof setInterval> | undefined;
   let started = 0;
   let stageStarted = 0;
   let frame = 0;
-  let stage: StatusStage = "routing";
+  let stage: StatusStage | undefined;
 
   return {
     show(nextStage: StatusStage) {
-      if (!enabled) return;
-      const now = performance.now();
-      if (stage !== nextStage || !timer) {
-        stage = nextStage;
-        stageStarted = now;
-      }
+      if (!animatedTerminal || stage === nextStage) return;
+      stage = nextStage;
+      stageStarted = performance.now();
       if (timer) return;
-      started = now;
+      started = stageStarted;
       timer = setInterval(() => {
+        if (!stage) return;
         const now = performance.now();
         const phrases = statusPhrases[stage];
         const label = phrases[Math.floor((now - stageStarted) / 4000) % phrases.length]!;
@@ -77,20 +75,21 @@ function createStatus() {
         const detail = visibleLabel ? `  ${visibleLabel}  ${elapsed}` : ` ${elapsed}`;
         const glyph = frames[frame++ % frames.length];
         const line = (glyph + detail).slice(0, width);
-        if (!color || !line) {
-          process.stdout.write(clearLine + line);
+        if (!terminalColor || !line) {
+          render(line);
           return;
         }
         const text = visibleLabel ? `  ${shimmerLabel(visibleLabel, frame)}` : "";
         const time = line.slice(visibleLabel ? visibleLabel.length + 3 : 1);
-        process.stdout.write(`${clearLine}\x1b[36m${glyph}\x1b[0m${text}\x1b[2m${time}\x1b[0m`);
+        render(`\x1b[36m${glyph}\x1b[0m${text}\x1b[2m${time}\x1b[0m`);
       }, 100).unref();
     },
     clear() {
+      stage = undefined;
       if (!timer) return;
       clearInterval(timer);
       timer = undefined;
-      if (frame > 0) process.stdout.write(clearLine);
+      if (frame > 0) render("");
       frame = 0;
     },
   };
@@ -104,21 +103,121 @@ const toolStatus = new Map<string, StatusStage>([
 ]);
 const editPrompt = "APPLY THIS EDIT? [Y/N] ";
 
+function createInput(lines: ReturnType<typeof createInterface>) {
+  const queue: string[] = [];
+  let wake: (() => void) | undefined;
+  let approval: { resolve: (accepted: boolean) => void; hasDraft: boolean } | undefined;
+  let closed = false;
+  let status = "";
+  let queueCount = 0;
+  let queueChangedAt = 0;
+
+  function render() {
+    if (!terminal || closed) return;
+    const now = performance.now();
+    if (queueCount !== queue.length) {
+      queueCount = queue.length;
+      queueChangedAt = now;
+    }
+    let pending = "";
+    if (queueCount) {
+      const last = queueAccents.length - 1;
+      const fade = status ? Math.min(Math.floor((now - queueChangedAt) / 120), last) : last;
+      pending = terminalColor
+        ? `\x1b[2mQUEUED\x1b[0m \x1b[${queueAccents[fade]}m${queueCount}\x1b[0m`
+        : `QUEUED ${queueCount}`;
+    }
+    const divider = terminalColor ? "  \x1b[2m│\x1b[0m  " : "  │  ";
+    const header = [status, pending].filter(Boolean).join(divider);
+    const prompt = approval && !approval.hasDraft ? editPrompt : "YCODE> ";
+    lines.setPrompt(header ? `${header}\n${prompt}` : prompt);
+    lines.prompt(true);
+  }
+
+  function confirm(accepted: boolean) {
+    if (!approval) return false;
+    const { resolve } = approval;
+    approval = undefined;
+    resolve(accepted);
+    render();
+    return true;
+  }
+
+  lines.on("line", line => {
+    const text = line.trim();
+    if (approval && !approval.hasDraft && /^(?:y|n)?$/i.test(text)) {
+      confirm(text.toLowerCase() === "y");
+      return;
+    }
+    if (approval) approval.hasDraft = false;
+    if (text) queue.push(text);
+    wake?.();
+    wake = undefined;
+    render();
+  });
+  lines.on("close", () => {
+    closed = true;
+    confirm(false);
+    wake?.();
+    wake = undefined;
+  });
+
+  return {
+    async next() {
+      while (!queue.length && !closed) {
+        render();
+        await new Promise<void>(resolve => { wake = resolve; });
+      }
+      const text = queue.shift();
+      render();
+      return text;
+    },
+    ask(): Promise<boolean> {
+      if (!terminal || closed) return Promise.resolve(false);
+      return new Promise(resolve => {
+        approval = { resolve, hasDraft: lines.line.length > 0 };
+        render();
+      });
+    },
+    rejectEdit: () => confirm(false),
+    showStatus(text: string) {
+      status = text;
+      render();
+    },
+    print(text: string, write = console.log) {
+      if (!terminal || closed) {
+        write(text);
+        return;
+      }
+      const rows = lines.getCursorPos().rows;
+      if (rows) moveCursor(process.stdout, 0, -rows);
+      cursorTo(process.stdout, 0);
+      clearScreenDown(process.stdout);
+      write(text);
+      // Keep the row offset readline will use when it redraws the current draft.
+      if (rows) process.stdout.write("\n".repeat(rows));
+      render();
+    },
+  };
+}
+
 async function previewEdit(
   tools: ReturnType<typeof workspaceTools>,
   confirm: () => Promise<boolean>,
+  print = console.log,
 ) {
   const edit = tools.getEdit();
   if (!edit) return;
 
-  console.log(`\nProposed change in ${JSON.stringify(edit.path)}`);
-  if (edit.oldText !== undefined) console.log("-", JSON.stringify(edit.oldText));
-  console.log("+", JSON.stringify(edit.newText));
+  const preview = [`\nProposed change in ${JSON.stringify(edit.path)}`];
+  if (edit.oldText !== undefined) preview.push(`- ${JSON.stringify(edit.oldText)}`);
+  preview.push(`+ ${JSON.stringify(edit.newText)}`);
+  print(preview.join("\n"));
 
   const approved = await confirm();
   if (approved) {
     await edit.apply();
-    console.log("Edit applied.");
+    print("Edit applied.");
   }
   const outcome = approved ? "The user approved the file change and it was applied." : "The proposed file change was not applied.";
   return { note: `${outcome} Path: ${edit.path}`, artifact: approved ? edit.path : undefined };
@@ -127,27 +226,21 @@ async function previewEdit(
 async function interact(chat: Chat, root: string) {
   const assistant = await openAssistant(root, chat);
   const lines = createInterface({ input: process.stdin, output: process.stdout, terminal });
-  const input = lines[Symbol.asyncIterator]();
-  const status = createStatus();
+  const input = createInput(lines);
+  const status = createStatus(input.showStatus);
   let active: AbortController | undefined;
   lines.on("SIGINT", () => {
     if (active) active.abort();
-    else lines.close();
+    else if (!input.rejectEdit()) lines.close();
   });
   if (terminal) lines.on("close", () => active?.abort());
   try {
     console.log("YCODE · /EXIT TO QUIT");
     while (true) {
-      if (terminal) {
-        lines.setPrompt("YCODE> ");
-        lines.prompt();
-      }
-      const next = await input.next();
-      if (next.done) break;
-      const text = next.value.trim();
+      const text = await input.next();
+      if (text === undefined) break;
       const command = text.toLowerCase();
       if (command === "/exit") break;
-      if (!text) continue;
       if (command === "/cancel") {
         assistant.cancelClarification();
         continue;
@@ -174,27 +267,21 @@ async function interact(chat: Chat, root: string) {
           async onAnswer(answer, title) {
             active = undefined;
             status.clear();
-            console.log(`[${title}] ${answer}`);
-            return previewEdit(tools, async () => {
-              if (!terminal) return false;
-              lines.setPrompt(editPrompt);
-              lines.prompt();
-              const answer = await input.next();
-              return !answer.done && answer.value.trim().toLowerCase() === "y";
-            });
+            input.print(`[${title}] ${answer}`);
+            return previewEdit(tools, input.ask, input.print);
           },
         };
         const resume = command === "/resume" || /^继续刚才没做完的(?:任务)?[。！!]?$/u.test(text);
         const result = resume ? await assistant.resume(turnTools, options) : await assistant.send(text, turnTools, options);
-        if (!result) console.log("NO UNFINISHED REQUEST");
+        if (!result) input.print("NO UNFINISHED REQUEST");
         else if (result.type === "question") {
           status.clear();
-          console.log(result.question + " (/CANCEL TO START OVER)");
+          input.print(result.question + " (/CANCEL TO START OVER)");
         }
       } catch (err) {
         status.clear();
-        if (controller.signal.aborted) console.log("REQUEST STOPPED. TYPE /RESUME TO CONTINUE.");
-        else console.error("ycode:", err instanceof Error ? err.message : String(err));
+        if (controller.signal.aborted) input.print("REQUEST STOPPED. TYPE /RESUME TO CONTINUE.");
+        else input.print(`ycode: ${err instanceof Error ? err.message : String(err)}`, console.error);
       } finally {
         active = undefined;
       }
