@@ -1,5 +1,5 @@
 import { mkdir, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Chat, Message } from "./agent";
 
 export type Task = {
@@ -43,7 +43,9 @@ export function routeKnownTask(input: string, tasks: readonly TaskCard[]): Extra
   if (matches.length === 1) return { action: "resume", id: matches[0]!.id };
 }
 
-export async function routeTask(input: string, chat: Chat, tasks: readonly TaskCard[], instructions = ""): Promise<Route> {
+export async function routeTask(
+  input: string, chat: Chat, tasks: readonly TaskCard[], instructions = "", signal?: AbortSignal,
+): Promise<Route> {
   const recent = tasks.slice(0, 20).map(({ id, title, goal, artifacts }) => ({
     id, title, goal: goal.slice(0, 500), artifacts,
   }));
@@ -59,7 +61,8 @@ export async function routeTask(input: string, chat: Chat, tasks: readonly TaskC
       instructions,
     ].join("\n") },
     { role: "user", content: JSON.stringify({ tasks: recent, input }) },
-  ], []);
+  ], [], signal);
+  signal?.throwIfAborted();
   const content = reply.content.trim();
   const json = /^\x60{3}(?:json)?\s*([\s\S]*?)\s*\x60{3}$/i.exec(content)?.[1] ?? content;
   let route: unknown;
@@ -85,14 +88,87 @@ export async function routeTask(input: string, chat: Chat, tasks: readonly TaskC
   throw new Error("The router returned an invalid task decision.");
 }
 
-export async function openTaskStore(root: string) {
-  const state = join(await realpath(root), ".ycode");
-  await mkdir(state, { recursive: true, mode: 0o700 });
-  if (await realpath(state) !== state) throw new Error("Expected a local .ycode directory.");
-  const directory = join(state, "tasks");
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  if (await realpath(directory) !== directory) throw new Error("Expected a local .ycode/tasks directory.");
+async function localDirectory(path: string) {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  if (await realpath(path) !== path) throw new Error(`Expected a local directory at ${path}.`);
+  return path;
+}
+
+async function writeRecord(path: string, data: unknown) {
+  const temporary = join(dirname(path), crypto.randomUUID() + ".tmp");
+  try {
+    await writeFile(temporary, JSON.stringify(data) + "\n", { flag: "wx", mode: 0o600 });
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+type TurnRecord = { request: string; task?: Pick<Task, "id" | "title"> };
+const turnFilename = /^\d{13}-[a-f0-9-]{36}(?:\.([1-9]\d*))?\.json$/;
+
+function isRunning(pid: string) {
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function openTurnJournal(directory: string) {
+  const activeName = () => `${Date.now()}-${crypto.randomUUID()}.${process.pid}.json`;
+
+  function track(name: string, record: TurnRecord) {
+    const path = join(directory, name);
+    return {
+      record,
+      selectTask: ({ id, title }: Pick<Task, "id" | "title">) => writeRecord(path, { ...record, task: { id, title } }),
+      complete: () => rm(path, { force: true }),
+      async release() {
+        const available = name.replace(`.${process.pid}.json`, ".json");
+        try {
+          await rename(path, join(directory, available));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      },
+    };
+  }
+
   return {
+    async begin(request: string) {
+      const name = activeName();
+      const record = { request };
+      await writeRecord(join(directory, name), record);
+      return track(name, record);
+    },
+    async resume() {
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries.sort((a, b) => b.name.localeCompare(a.name))) {
+        const match = entry.isFile() && turnFilename.exec(entry.name);
+        if (!match || (match[1] && isRunning(match[1]))) continue;
+        const path = join(directory, entry.name);
+        const name = activeName();
+        try {
+          const record: TurnRecord = JSON.parse(await readFile(path, "utf8"));
+          // A rename claims the request even when two terminals try to resume it.
+          await rename(path, join(directory, name));
+          return track(name, record);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+    },
+  };
+}
+
+export async function openTaskStore(root: string) {
+  const state = await localDirectory(join(await realpath(root), ".ycode"));
+  const directory = await localDirectory(join(state, "tasks"));
+  const journal = openTurnJournal(await localDirectory(join(state, "pending")));
+  return {
+    journal,
     async list(): Promise<Task[]> {
       const entries = await readdir(directory, { withFileTypes: true });
       const tasks = await Promise.all(entries
@@ -105,13 +181,7 @@ export async function openTaskStore(root: string) {
     },
     async save(task: Task) {
       if (!/^[a-f0-9-]{36}$/.test(task.id)) throw new Error("Invalid task ID.");
-      const temporary = join(directory, crypto.randomUUID() + ".tmp");
-      try {
-        await writeFile(temporary, JSON.stringify(task) + "\n", { flag: "wx", mode: 0o600 });
-        await rename(temporary, join(directory, task.id + ".json"));
-      } finally {
-        await rm(temporary, { force: true });
-      }
+      await writeRecord(join(directory, task.id + ".json"), task);
     },
   };
 }

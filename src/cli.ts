@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { runTurn, type Chat } from "./agent";
-import { openAssistant } from "./assistant";
+import { runTurn, type Chat, type Tools } from "./agent";
+import { openAssistant, type TurnOptions } from "./assistant";
 import { codex } from "./codex";
 import { ollama } from "./ollama";
 import { workspaceTools } from "./tools";
@@ -129,6 +129,12 @@ async function interact(chat: Chat, root: string) {
   const lines = createInterface({ input: process.stdin, output: process.stdout, terminal });
   const input = lines[Symbol.asyncIterator]();
   const status = createStatus();
+  let active: AbortController | undefined;
+  lines.on("SIGINT", () => {
+    if (active) active.abort();
+    else lines.close();
+  });
+  if (terminal) lines.on("close", () => active?.abort());
   try {
     console.log("YCODE · /EXIT TO QUIT");
     while (true) {
@@ -146,9 +152,11 @@ async function interact(chat: Chat, root: string) {
         assistant.cancelClarification();
         continue;
       }
+      const controller = new AbortController();
+      active = controller;
       try {
         const tools = workspaceTools(root, allowEdit);
-        const result = await assistant.send(text, {
+        const turnTools: Tools = {
           definitions: tools.definitions,
           async execute(name, args) {
             status.show(toolStatus.get(name) ?? "tool");
@@ -158,10 +166,13 @@ async function interact(chat: Chat, root: string) {
               status.show("answering");
             }
           },
-        }, {
+        };
+        const options: TurnOptions = {
           instructions,
+          signal: controller.signal,
           onProgress: status.show,
           async onAnswer(answer, title) {
+            active = undefined;
             status.clear();
             console.log(`[${title}] ${answer}`);
             return previewEdit(tools, async () => {
@@ -172,14 +183,20 @@ async function interact(chat: Chat, root: string) {
               return !answer.done && answer.value.trim().toLowerCase() === "y";
             });
           },
-        });
-        if (result.type === "question") {
+        };
+        const resume = command === "/resume" || /^继续刚才没做完的(?:任务)?[。！!]?$/u.test(text);
+        const result = resume ? await assistant.resume(turnTools, options) : await assistant.send(text, turnTools, options);
+        if (!result) console.log("NO UNFINISHED REQUEST");
+        else if (result.type === "question") {
           status.clear();
           console.log(result.question + " (/CANCEL TO START OVER)");
         }
       } catch (err) {
         status.clear();
-        console.error("ycode:", err instanceof Error ? err.message : String(err));
+        if (controller.signal.aborted) console.log("REQUEST STOPPED. TYPE /RESUME TO CONTINUE.");
+        else console.error("ycode:", err instanceof Error ? err.message : String(err));
+      } finally {
+        active = undefined;
       }
     }
   } finally {

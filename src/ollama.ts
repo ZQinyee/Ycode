@@ -2,12 +2,13 @@ import type { Chat, Reply } from "./agent";
 
 export function ollama(baseURL: string, model: string): Chat {
   const url = new URL("/api/chat", baseURL);
-  return async (messages, tools) => {
+  return async (messages, tools, signal) => {
+    const timeout = AbortSignal.timeout(120_000);
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model, messages, tools, stream: false }),
-      signal: AbortSignal.timeout(120_000),
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     });
     if (!response.ok) throw new Error(`Ollama HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
     const { message } = await response.json();

@@ -38,6 +38,61 @@ test("a self-contained response takes one model call and is saved in its task", 
   }
 });
 
+test("an interrupted request survives other work and resumes in its original task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ycode-interrupt-"));
+  const controller = new AbortController();
+  const started = Promise.withResolvers<void>();
+  const reportId = crypto.randomUUID();
+  const request = "再加个英文标题";
+  const calls: string[] = [];
+  const chat: Chat = async (messages, _, signal) => {
+    const input = messages.at(-1)!.content;
+    calls.push(input.startsWith("{") ? JSON.parse(input).input : input);
+    if (input.startsWith("{")) {
+      const { input: text } = JSON.parse(input);
+      const route = text === request
+        ? { action: "resume", id: reportId }
+        : { action: "new", title: "计算", answer: "56" };
+      return { role: "assistant", content: JSON.stringify(route) };
+    }
+    expect(input).toBe(request);
+    expect(messages.some(message => message.content === "发布进度周报")).toBe(true);
+    if (signal === controller.signal) {
+      started.resolve();
+      await new Promise<never>((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
+    return { role: "assistant", content: "Release Update" };
+  };
+  const tools = { definitions: [], async execute() { throw new Error("Unexpected tool call"); } };
+  try {
+    const store = await openTaskStore(root);
+    await store.save({
+      id: reportId, title: "写周报", goal: "写周报", artifacts: [], updatedAt: 0,
+      history: [{ role: "user", content: "写周报" }, { role: "assistant", content: "发布进度周报" }],
+    });
+    const assistant = await openAssistant(root, chat);
+    const attempt = assistant.send(request, tools, { signal: controller.signal }).catch((error: unknown) => error);
+    await started.promise;
+    expect(await (await openAssistant(root, chat)).resume(tools)).toBeUndefined();
+    controller.abort();
+    expect(await attempt).toMatchObject({ name: "AbortError" });
+    expect((await store.list())[0]?.history).toHaveLength(2);
+    expect(await assistant.send("算 7×8", tools)).toMatchObject({ answer: "56" });
+
+    const reopened = await openAssistant(root, chat);
+    expect(await reopened.resume(tools)).toMatchObject({ answer: "Release Update", task: { id: reportId } });
+    expect(await reopened.resume(tools)).toBeUndefined();
+    expect(calls).toEqual([request, request, "算 7×8", request]);
+    expect((await store.list()).find(task => task.id === reportId)?.history.map(message => message.content))
+      .toEqual(["写周报", "发布进度周报", request, "Release Update"]);
+  } finally {
+    controller.abort();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("the terminal assistant switches tasks, clarifies follow-ups, and resumes a saved task after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "ycode-tasks-"));
   const calls: string[] = [];
