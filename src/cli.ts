@@ -17,30 +17,73 @@ const instructions = [
   "Propose at most one edit per turn. A proposed edit still needs the user's approval.",
 ].join("\n");
 
+const statusPhrases = {
+  routing: ["FINDING THE RIGHT TASK", "CONNECTING THE DOTS", "LOOKING FOR A MATCH"],
+  answering: ["ON IT", "PUTTING THE ANSWER TOGETHER", "STILL WORKING ON IT"],
+  listing: ["SCANNING THE FOLDER"],
+  reading: ["READING THE FILE"],
+  editing: ["DRAFTING THE CHANGE"],
+  tool: ["RUNNING A TOOL"],
+} as const;
+
+type StatusStage = keyof typeof statusPhrases;
+
+const glowStyles = ["1;96", "96", "36", "2;36"] as const;
+
+function shimmerLabel(label: string, frame: number) {
+  const center = frame % (label.length + 6) - 3;
+  let styled = "";
+  let previous = "";
+  for (let index = 0; index < label.length; index++) {
+    const distance = Math.min(Math.abs(index - center), glowStyles.length - 1);
+    const style = glowStyles[distance];
+    if (style !== previous) {
+      styled += `\x1b[0;${style}m`;
+      previous = style;
+    }
+    styled += label[index];
+  }
+  return styled + "\x1b[0m";
+}
+
 function createStatus() {
   const enabled = terminal && process.env.TERM !== "dumb";
-  const color = enabled && process.stdout.hasColors();
+  const color = enabled && !process.env.NO_COLOR && process.stdout.hasColors();
   const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
   const clearLine = "\r\x1b[2K";
   let timer: ReturnType<typeof setInterval> | undefined;
   let started = 0;
+  let stageStarted = 0;
   let frame = 0;
-  let label = "";
+  let stage: StatusStage = "routing";
 
   return {
-    show(stage: string) {
+    show(nextStage: StatusStage) {
       if (!enabled) return;
-      label = stage;
+      const now = performance.now();
+      if (stage !== nextStage || !timer) {
+        stage = nextStage;
+        stageStarted = now;
+      }
       if (timer) return;
-      started = performance.now();
+      started = now;
       timer = setInterval(() => {
+        const now = performance.now();
+        const phrases = statusPhrases[stage];
+        const label = phrases[Math.floor((now - stageStarted) / 4000) % phrases.length]!;
         const width = Math.max(0, (process.stdout.columns || 80) - 1);
-        const elapsed = `${((performance.now() - started) / 1000).toFixed(1)}s`;
-        const labelWidth = width - elapsed.length - 5;
-        const detail = labelWidth > 0 ? `  ${label.slice(0, labelWidth)}  ${elapsed}` : ` ${elapsed}`;
+        const elapsed = `${((now - started) / 1000).toFixed(1)}S`;
+        const visibleLabel = label.slice(0, Math.max(0, width - elapsed.length - 5));
+        const detail = visibleLabel ? `  ${visibleLabel}  ${elapsed}` : ` ${elapsed}`;
         const glyph = frames[frame++ % frames.length];
         const line = (glyph + detail).slice(0, width);
-        process.stdout.write(clearLine + (color && line ? `\x1b[36m${glyph}\x1b[0m${line.slice(1)}` : line));
+        if (!color || !line) {
+          process.stdout.write(clearLine + line);
+          return;
+        }
+        const text = visibleLabel ? `  ${shimmerLabel(visibleLabel, frame)}` : "";
+        const time = line.slice(visibleLabel ? visibleLabel.length + 3 : 1);
+        process.stdout.write(`${clearLine}\x1b[36m${glyph}\x1b[0m${text}\x1b[2m${time}\x1b[0m`);
       }, 100).unref();
     },
     clear() {
@@ -53,11 +96,11 @@ function createStatus() {
   };
 }
 
-const toolStatus = new Map([
-  ["list_files", "Listing files"],
-  ["read_file", "Reading file"],
-  ["write_file", "Preparing edit"],
-  ["replace_text", "Preparing edit"],
+const toolStatus = new Map<string, StatusStage>([
+  ["list_files", "listing"],
+  ["read_file", "reading"],
+  ["write_file", "editing"],
+  ["replace_text", "editing"],
 ]);
 const editPrompt = "APPLY THIS EDIT? [Y/N] ";
 
@@ -108,18 +151,16 @@ async function interact(chat: Chat, root: string) {
         const result = await assistant.send(text, {
           definitions: tools.definitions,
           async execute(name, args) {
-            status.show(toolStatus.get(name) ?? "Running tool");
+            status.show(toolStatus.get(name) ?? "tool");
             try {
               return await tools.execute(name, args);
             } finally {
-              status.show("Waiting for model");
+              status.show("answering");
             }
           },
         }, {
           instructions,
-          onProgress(stage) {
-            status.show(stage === "routing" ? "Finding task" : "Waiting for model");
-          },
+          onProgress: status.show,
           async onAnswer(answer, title) {
             status.clear();
             console.log(`[${title}] ${answer}`);
