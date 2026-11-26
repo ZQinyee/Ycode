@@ -40,6 +40,9 @@ test("a self-contained response takes one model call and is saved in its task", 
 
 test("the terminal assistant switches tasks, clarifies follow-ups, and resumes a saved task after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "ycode-tasks-"));
+  const calls: string[] = [];
+  const followUp = "继续改 report.md，把标题再短一点";
+  const namedFollowUp = "继续 [写周报]：加上英文标题";
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -47,6 +50,7 @@ test("the terminal assistant switches tasks, clarifies follow-ups, and resumes a
       const { messages, tools } = await request.json() as { messages: Message[]; tools: unknown[] };
       const last = messages.at(-1)!;
       const reply = (content: string) => Response.json({ message: { role: "assistant", content } });
+      calls.push(tools.length === 0 ? "routing" : "answering");
 
       if (tools.length === 0) {
         const { input, tasks } = JSON.parse(last.content);
@@ -54,6 +58,12 @@ test("the terminal assistant switches tasks, clarifies follow-ups, and resumes a
         if (input === "查大文件") return reply(JSON.stringify({ action: "new", title: "查大文件" }));
         if (input === "刚才那个再短一点") {
           return reply(JSON.stringify({ action: "clarify", question: "你指的是周报还是文件列表？" }));
+        }
+        if (input === followUp) {
+          return reply(JSON.stringify({ action: "clarify", question: "你要继续哪个 report.md 任务？" }));
+        }
+        if (input === namedFollowUp) {
+          return reply(JSON.stringify({ action: "clarify", question: "你要继续哪个同名周报任务？" }));
         }
         const report = tasks.find((task: { title: string }) => task.title === "写周报");
         if (report && input.includes("周报")) return reply(JSON.stringify({ action: "resume", id: report.id }));
@@ -80,6 +90,9 @@ test("the terminal assistant switches tasks, clarifies follow-ups, and resumes a
       if (last.content === "继续改周报" && messages.some(message => message.content === "短版周报")) {
         return reply("恢复后继续改周报");
       }
+      if (last.content === followUp) return reply("标题已进一步缩短");
+      if (last.content === namedFollowUp) return reply("已补充英文标题");
+      if (last.content.endsWith("：加上日期")) return reply("已补充日期");
       return new Response("Unexpected task input", { status: 400 });
     },
   });
@@ -103,6 +116,24 @@ test("the terminal assistant switches tasks, clarifies follow-ups, and resumes a
     expect(first).toContain("[写周报] 长版周报\n[查大文件] 文件列表\n你指的是周报还是文件列表？");
     expect(first).toContain("[写周报] 短版周报");
     expect(await run("继续改周报", "/exit")).toContain("[写周报] 恢复后继续改周报");
+
+    const store = await openTaskStore(root);
+    const tasks = await store.list();
+    const report = tasks.find(task => task.title === "写周报")!;
+    const files = tasks.find(task => task.title === "查大文件")!;
+    await store.save({ ...report, artifacts: ["report.md"] });
+
+    calls.length = 0;
+    const direct = await run(followUp, `继续 ${report.id}：加上日期`, namedFollowUp, "/exit");
+    expect(direct).toContain("[写周报] 标题已进一步缩短\n[写周报] 已补充日期\n[写周报] 已补充英文标题");
+    expect(calls).toEqual(["answering", "answering", "answering"]);
+
+    await store.save({ ...files, title: report.title, artifacts: ["report.md"] });
+    calls.length = 0;
+    const ambiguous = await run(followUp, "/cancel", namedFollowUp, "/exit");
+    expect(ambiguous).toContain("你要继续哪个 report.md 任务？");
+    expect(ambiguous).toContain("你要继续哪个同名周报任务？");
+    expect(calls).toEqual(["routing", "routing"]);
   } finally {
     server.stop(true);
     await rm(root, { recursive: true, force: true });

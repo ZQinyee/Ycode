@@ -1,5 +1,5 @@
 import { runTurn, type Chat, type Tools } from "./agent";
-import { openTaskStore, routeTask, type Task } from "./tasks";
+import { openTaskStore, routeKnownTask, routeTask, type Task } from "./tasks";
 
 type TurnOptions = {
   instructions?: string;
@@ -19,9 +19,10 @@ export async function openAssistant(workspace: string, chat: Chat) {
       const request = pending
         ? `Original request: ${pending.request}\nClarifying question: ${pending.question}\nUser's answer: ${text}`
         : text;
-      options.onProgress?.("routing");
       const tasks = await store.list();
-      const route = await routeTask(request, chat, tasks, options.instructions);
+      const known = pending ? undefined : routeKnownTask(request, tasks);
+      if (!known) options.onProgress?.("routing");
+      const route = known ?? await routeTask(request, chat, tasks, options.instructions);
       if (route.action === "clarify") {
         pending = { request, question: route.question };
         return { type: "question" as const, question: route.question };

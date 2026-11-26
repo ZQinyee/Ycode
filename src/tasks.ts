@@ -17,6 +17,32 @@ type Route =
   | { action: "resume"; id: string; answer?: string }
   | { action: "clarify"; question: string };
 
+export function routeKnownTask(input: string, tasks: readonly TaskCard[]): Extract<Route, { action: "resume" }> | undefined {
+  const request = input.trim();
+  const continuation = /^(?:请\s*)?(?:继续|接着)(?:修改|编辑|更新|改)?\s*/u.exec(request)
+    ?? /^(?:please\s+)?(?:resume|continue(?:\s+(?:editing|updating|working\s+on))?)\s+/iu.exec(request);
+  if (!continuation) return;
+
+  const selector = request.slice(continuation[0].length);
+  if (selector.startsWith("[")) {
+    const matches = tasks.filter(task => {
+      const label = `[${task.title}]`;
+      return selector.startsWith(label) && /^\s*(?:$|[，：,:]|。$)/u.test(selector.slice(label.length));
+    });
+    if (matches.length === 1) return { action: "resume", id: matches[0]!.id };
+    if (matches.length > 1) return;
+  }
+
+  // A file mentioned elsewhere in the request can be an input to a different task.
+  const target = /^(?:`([^`\r\n]+)`|([^\s`，：,:。！？]+))\s*(?:$|[，：,:]|。$)/u.exec(selector);
+  if (!target) return;
+
+  const reference = target[1] ?? target[2]!;
+  const path = reference.replace(/^\.\//, "");
+  const matches = tasks.filter(task => task.id === reference || task.artifacts.includes(path));
+  if (matches.length === 1) return { action: "resume", id: matches[0]!.id };
+}
+
 export async function routeTask(input: string, chat: Chat, tasks: readonly TaskCard[], instructions = ""): Promise<Route> {
   const recent = tasks.slice(0, 20).map(({ id, title, goal, artifacts }) => ({
     id, title, goal: goal.slice(0, 500), artifacts,

@@ -17,10 +17,48 @@ const instructions = [
   "Propose at most one edit per turn. A proposed edit still needs the user's approval.",
 ].join("\n");
 
-function showStatus(status = "") {
-  if (terminal) process.stdout.write(`\r\x1b[2K${status}`);
+function createStatus() {
+  const enabled = terminal && process.env.TERM !== "dumb";
+  const color = enabled && process.stdout.hasColors();
+  const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+  const clearLine = "\r\x1b[2K";
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let started = 0;
+  let frame = 0;
+  let label = "";
+
+  return {
+    show(stage: string) {
+      if (!enabled) return;
+      label = stage;
+      if (timer) return;
+      started = performance.now();
+      timer = setInterval(() => {
+        const width = Math.max(0, (process.stdout.columns || 80) - 1);
+        const elapsed = `${((performance.now() - started) / 1000).toFixed(1)}s`;
+        const labelWidth = width - elapsed.length - 5;
+        const detail = labelWidth > 0 ? `  ${label.slice(0, labelWidth)}  ${elapsed}` : ` ${elapsed}`;
+        const glyph = frames[frame++ % frames.length];
+        const line = (glyph + detail).slice(0, width);
+        process.stdout.write(clearLine + (color && line ? `\x1b[36m${glyph}\x1b[0m${line.slice(1)}` : line));
+      }, 100).unref();
+    },
+    clear() {
+      if (!timer) return;
+      clearInterval(timer);
+      timer = undefined;
+      if (frame > 0) process.stdout.write(clearLine);
+      frame = 0;
+    },
+  };
 }
 
+const toolStatus = new Map([
+  ["list_files", "Listing files"],
+  ["read_file", "Reading file"],
+  ["write_file", "Preparing edit"],
+  ["replace_text", "Preparing edit"],
+]);
 const editPrompt = "APPLY THIS EDIT? [Y/N] ";
 
 async function previewEdit(
@@ -47,6 +85,7 @@ async function interact(chat: Chat, root: string) {
   const assistant = await openAssistant(root, chat);
   const lines = createInterface({ input: process.stdin, output: process.stdout, terminal });
   const input = lines[Symbol.asyncIterator]();
+  const status = createStatus();
   try {
     console.log("YCODE · /EXIT TO QUIT");
     while (true) {
@@ -66,13 +105,23 @@ async function interact(chat: Chat, root: string) {
       }
       try {
         const tools = workspaceTools(root, allowEdit);
-        const result = await assistant.send(text, tools, {
+        const result = await assistant.send(text, {
+          definitions: tools.definitions,
+          async execute(name, args) {
+            status.show(toolStatus.get(name) ?? "Running tool");
+            try {
+              return await tools.execute(name, args);
+            } finally {
+              status.show("Waiting for model");
+            }
+          },
+        }, {
           instructions,
           onProgress(stage) {
-            showStatus(stage === "routing" ? "ROUTING…" : "WAITING FOR MODEL…");
+            status.show(stage === "routing" ? "Finding task" : "Waiting for model");
           },
           async onAnswer(answer, title) {
-            showStatus();
+            status.clear();
             console.log(`[${title}] ${answer}`);
             return previewEdit(tools, async () => {
               if (!terminal) return false;
@@ -84,15 +133,16 @@ async function interact(chat: Chat, root: string) {
           },
         });
         if (result.type === "question") {
-          showStatus();
+          status.clear();
           console.log(result.question + " (/CANCEL TO START OVER)");
         }
       } catch (err) {
-        showStatus();
+        status.clear();
         console.error("ycode:", err instanceof Error ? err.message : String(err));
       }
     }
   } finally {
+    status.clear();
     lines.close();
   }
 }
