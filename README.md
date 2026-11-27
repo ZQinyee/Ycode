@@ -43,12 +43,25 @@ python3 -m venv .venv
 /path/to/Ycode/.venv/bin/python /path/to/Ycode/ycode.py "这个项目的入口在哪里？"
 ```
 
+## 查看运行轨迹
+
+每次交互请求、`/parallel`、`/resume` 或单次命令都会在工作目录的 `.ycode/runs/` 写一份 JSONL。按 `run_id` 确定是哪次运行，按 `step_id` 找到模型调用，按 `tool_call_id` 对上工具的开始和结束。轨迹包含路由决定、工具参数和结果、耗时、错误及取消状态。文件工具提出的修改和实际应用的结果分别记录。
+
+模型调用结束时会记录后端返回的 `usage`。可以通过 `YCODE_TOKEN_RATES_USD` 提供每百万 token 的美元费率，以计算每次模型调用的估算费用。
+
+```sh
+YCODE_TOKEN_RATES_USD='{"input":2,"cached_input":0.5,"output":4}' .venv/bin/python ycode.py "读一下 README"
+```
+
+上面的费率用于举例。缺少费率或用量时，`estimated_cost_usd` 为 `null`。未单独设置缓存输入费率时使用普通输入费率。轨迹包含用户请求、模型回复和工具输出，保存在本地，`.ycode/` 已加入 Git 忽略列表。
+
 ## 代码结构
 
 - `ycode.py` 是 CLI 入口，`ycode_core/cli.py` 处理终端输入和确认。
 - `ycode_core/agent.py` 负责路由和工具循环，每轮最多执行 12 次工具调用。应用也可以通过 `Assistant(store, chat).send(text, tools)` 接入自己的模型和工具。
 - `ycode_core/storage.py` 保存独立的任务历史和待处理消息，可以直接使用已有的 `.ycode/` 数据。
 - `ycode_core/models.py` 接入 Codex CLI 和 Ollama，`ycode_core/jobs.py` 管理后台命令。
+- `ycode_core/trace.py` 记录每次运行的 JSONL 事件和用量估算。
 - `ycode_core/tools.py` 提供工作区的列目录、读文件、创建文件和文本替换。文本文件上限为 64 KiB。
 
 ## 开发

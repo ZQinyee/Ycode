@@ -15,6 +15,7 @@ from .jobs import Jobs
 from .models import Chat, configured_chat
 from .storage import Store
 from .tools import Edit, Workspace
+from .trace import Trace, span
 
 
 STATUS = {
@@ -294,18 +295,23 @@ class Console:
 
 async def run_cli(edit: bool, task: str):
     root = Path.cwd().resolve()
-    async with configured_chat() as chat:
-        if not task:
+    if not task:
+        async with configured_chat() as chat:
             await Console(root, chat, edit).interact()
-            return
+        return
+    with Trace(root).run(task, "one_shot") as trace:
         tools = Workspace(root, edit)
-        answer, _ = await run_turn(task, chat, tools)
+        async with configured_chat() as chat:
+            answer, _ = await run_turn(task, chat, tools, trace=trace)
         print(answer)
         if tools.edit:
-            print(tools.edit.preview())
-            if sys.stdin.isatty() and sys.stdout.isatty() and input(EDIT_PROMPT).strip().lower() == "y":
-                tools.edit.apply()
-                print("Edit applied.")
+            with span(trace, "edit", **trace.edit_call, path=tools.edit.relative_path) as event:
+                print(tools.edit.preview())
+                approved = sys.stdin.isatty() and sys.stdout.isatty() and input(EDIT_PROMPT).strip().lower() == "y"
+                if approved:
+                    tools.edit.apply()
+                    print("Edit applied.")
+                event["applied"] = approved
 
 
 def main() -> int:

@@ -9,6 +9,10 @@ from pathlib import Path
 MAX_FILE_SIZE = 64 * 1024
 
 
+class ToolError(str):
+    pass
+
+
 def read_text(path: Path) -> str:
     if not path.is_file() or path.stat().st_size > MAX_FILE_SIZE:
         raise ValueError("Expected a file of at most 64 KiB.")
@@ -103,7 +107,7 @@ class Workspace:
                 return "\n".join(rows) or "[empty directory]"
             return self.propose(name, path, args)
         except (OSError, UnicodeError, ValueError) as error:
-            return f"Tool error: {error}"
+            return ToolError(f"Tool error: {error}")
 
     def propose(self, name: str, path: Path, args: dict) -> str:
         if self.edit:
