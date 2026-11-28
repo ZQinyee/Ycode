@@ -29,19 +29,13 @@ def read_text(path: Path) -> str:
 class Edit:
     path: Path
     relative_path: str
-    new_text: str
-    old_text: str | None = None
+    after: str
     before: str | None = None
-
-    def updated_text(self) -> str:
-        if self.before is None:
-            return self.new_text
-        return self.before.replace(self.old_text, self.new_text, 1)
 
     def preview(self) -> str:
         lines = ["", f"Proposed change in {json.dumps(self.relative_path, ensure_ascii=False)}"]
         before = StringIO(self.before or "", newline="\n").readlines()
-        after = StringIO(self.updated_text(), newline="\n").readlines()
+        after = StringIO(self.after, newline="\n").readlines()
         source = "/dev/null" if self.before is None else f"a/{self.relative_path}"
         for line in unified_diff(before, after, fromfile=source, tofile=f"b/{self.relative_path}", n=2):
             lines.append(line.removesuffix("\n"))
@@ -58,11 +52,11 @@ class Edit:
             if self.path.parent.resolve() != self.path.parent:
                 raise ValueError("The destination directory changed.")
             with self.path.open("xb") as output:
-                output.write(self.new_text.encode("utf-8"))
+                output.write(self.after.encode("utf-8"))
             return
         if self.path.resolve() != self.path or read_text(self.path) != self.before:
             raise ValueError("The file changed after the proposal. Run Ycode again to refresh it.")
-        self.path.write_bytes(self.updated_text().encode("utf-8"))
+        self.path.write_bytes(self.after.encode("utf-8"))
 
 
 class Workspace:
@@ -144,7 +138,8 @@ class Workspace:
         start = before.find(old)
         if start < 0 or before.find(old, start + 1) != -1:
             raise ValueError("old_text must match exactly once.")
-        if "\0" in new or len(before.replace(old, new, 1).encode("utf-8")) > MAX_FILE_SIZE:
+        after = before.replace(old, new, 1)
+        if "\0" in new or len(after.encode("utf-8")) > MAX_FILE_SIZE:
             raise ValueError("The edited file must be UTF-8 text of at most 64 KiB.")
-        self.edit = Edit(path, relative_path, new, old, before)
+        self.edit = Edit(path, relative_path, after, before)
         return "Replacement prepared for review."

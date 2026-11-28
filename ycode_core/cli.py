@@ -196,7 +196,7 @@ class Console:
         async with self.review_lock:
             applied = await confirm_edit(edit, self.ask_approval, answer=answer, title=title)
             if applied:
-                self.approved_files[edit.relative_path] = sha256(edit.updated_text().encode("utf-8")).hexdigest()
+                self.approved_files[edit.relative_path] = sha256(edit.after.encode("utf-8")).hexdigest()
             return applied
 
     async def ask_approval(self, prompt: str = EDIT_PROMPT) -> bool:

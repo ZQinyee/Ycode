@@ -162,7 +162,8 @@ async def run_turn(request: str, chat: Chat, tools: Tools, history: Sequence[dic
         if not calls:
             if not reply["content"].strip():
                 raise ValueError("Model returned an empty answer.")
-            return reply["content"], [*history, *messages, reply]
+            messages.append(reply)
+            return reply["content"], messages
         if not remaining:
             raise ValueError("The model requested tools after the tool-call budget was exhausted.")
         executable_calls = calls[:remaining]
@@ -240,9 +241,13 @@ class Assistant:
             return None
         try:
             record = turn.record
+            recovering = "result" in record
             mode = "resume" if entry is None else "parallel" if record.get("newTask") else "interactive"
             with Trace(self.store.state.parent).run(record["request"], mode) as trace:
-                return await self._send(turn, tools, progress, review, instructions, trace, entry is not None)
+                response = await self._send(turn, tools, progress, review, instructions, trace, entry is not None)
+                if review and "task" in response and (recovering or "edit" not in record["result"]):
+                    await review(response["answer"], record["task"]["title"], None)
+                return response
         finally:
             turn.release()
 
@@ -273,10 +278,7 @@ class Assistant:
         fresh = {"id": task_id, "title": action["title"], "goal": request, "history": [], "artifacts": []}
         if "result" in record:
             with self.store.updating(fresh) as current:
-                response = self.store.commit(turn, current)
-            if review:
-                await review(response["answer"], action["title"], None)
-            return response
+                return self.store.commit(turn, current)
 
         task = self.store.load_task(task_id) or fresh
         history = task["history"]
@@ -284,16 +286,12 @@ class Assistant:
         answer = action.get("answer")
         if self.executor and (not answer or task.get("codexThreadId") or record.get("codexThreadId")):
             with self.store.updating(fresh, expected_revision=revision) as current:
-                response = await self.run_codex(turn, current, request, progress, trace)
-            if review:
-                await review(response["answer"], action["title"], None)
-            return response
+                return await self.run_codex(turn, current, request, progress, trace)
         if answer:
             messages = [{"role": "user", "content": request}, {"role": "assistant", "content": answer}]
         else:
-            answer, transcript = await run_turn(request, self.chat, tools, history, progress, instructions, trace=trace,
-                                                summary=task.get("memory"), context_bytes=self.context_bytes)
-            messages = transcript[len(history):]
+            answer, messages = await run_turn(request, self.chat, tools, history, progress, instructions, trace=trace,
+                                              summary=task.get("memory"), context_bytes=self.context_bytes)
         result = {"id": str(uuid4()), "answer": answer, "messages": messages}
         edit = getattr(tools, "edit", None)
         with self.store.updating(fresh, expected_revision=revision) as current:
@@ -307,10 +305,7 @@ class Assistant:
                 applied = await review_change(edit, trace, decide)
                 result["edit"]["state"] = "applied" if applied else "declined"
             turn.checkpoint(result)
-            response = self.store.commit(turn, current)
-        if review and not edit:
-            await review(answer, task["title"], None)
-        return response
+            return self.store.commit(turn, current)
 
     async def run_codex(self, turn: Turn, task: dict, request: str, progress: Progress, trace: Trace) -> dict:
         thread_id = turn.record.get("codexThreadId") or task.get("codexThreadId")

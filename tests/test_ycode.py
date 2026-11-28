@@ -11,7 +11,7 @@ import unittest
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, call, patch
 from uuid import uuid4
 
 from ycode_core.agent import Assistant, run_turn
@@ -66,9 +66,13 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
                 checkpoint("native-thread", "native-turn")
                 return CodexResult("Native answer", "native-thread", ["changed.py"])
 
-        first = await Assistant(self.store, router, executor=Executor()).send("改代码", self.workspace)
-        second = await Assistant(Store(self.root), self.unexpected_chat, executor=Executor()).send("运行测试", self.workspace)
+        review = AsyncMock()
+        first = await Assistant(self.store, router, executor=Executor()).send("改代码", self.workspace, review=review)
+        second = await Assistant(Store(self.root), self.unexpected_chat, executor=Executor()).send(
+            "运行测试", self.workspace, review=review,
+        )
         self.assertEqual(calls, [("改代码", None, None), ("运行测试", "native-thread", None)])
+        self.assertEqual(review.await_args_list, [call("Native answer", "Edit", None)] * 2)
         self.assertEqual(first["task"]["id"], second["task"]["id"])
         self.assertEqual(second["task"]["codexThreadId"], "native-thread")
         self.assertEqual(second["task"]["artifacts"], ["changed.py"])
@@ -209,11 +213,13 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(messages[-1]["content"], "Follow up")
             return reply("Done")
 
-        answer, transcript = await run_turn("Follow up", chat, self.workspace, history,
-                                            summary={"through": 4, "text": "Facts from early turns"}, context_bytes=4096)
+        original = list(history)
+        answer, messages = await run_turn("Follow up", chat, self.workspace, history,
+                                          summary={"through": 4, "text": "Facts from early turns"}, context_bytes=4096)
         self.assertEqual(answer, "Done")
-        self.assertEqual(transcript[:-2], history)
-        self.assertEqual(transcript[-4]["content"], "页" * 2000)
+        self.assertEqual(messages, [{"role": "user", "content": "Follow up"}, reply("Done")])
+        self.assertEqual(history, original)
+        self.assertEqual(history[-2]["content"], "页" * 2000)
 
     async def test_summary_merges_with_new_turns_and_advances_incrementally(self):
         task = self.long_task()
@@ -294,8 +300,10 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.store, "save_task", side_effect=OSError("disk full")):
             with self.assertRaisesRegex(OSError, "disk full"):
                 await Assistant(self.store, chat).send("Report", self.workspace)
+        review = AsyncMock()
         with patch.object(self.store, "task_cards", side_effect=AssertionError("task lookup")):
-            result = await Assistant(self.store, self.unexpected_chat).send(None, self.workspace)
+            result = await Assistant(self.store, self.unexpected_chat).send(None, self.workspace, review=review)
+        review.assert_awaited_once_with("Ready", "Report", None)
         self.assertEqual(result["answer"], "Ready")
         self.assertEqual(len(result["task"]["history"]), 2)
         self.assertIsNone(self.store.resume())
@@ -387,8 +395,10 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
                              ["你好", "发布进度周报", "继续 [周报]：更新标题"])
             return reply("本周进度")
 
-        first = await Assistant(self.store, chat).send("你好", self.workspace)
-        second = await Assistant(Store(self.root), chat).send("继续 [周报]：更新标题", self.workspace)
+        review = AsyncMock()
+        first = await Assistant(self.store, chat).send("你好", self.workspace, review=review)
+        second = await Assistant(Store(self.root), chat).send("继续 [周报]：更新标题", self.workspace, review=review)
+        self.assertEqual(review.await_args_list, [call("发布进度周报", "周报", None), call("本周进度", "周报", None)])
         self.assertEqual(second["task"]["id"], first["task"]["id"])
         self.assertEqual(second["answer"], "本周进度")
         traces = {events[0]["request"]: events for events in self.traces()}
@@ -628,7 +638,8 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
         after = before.replace("'old'", "'新'")
         path.write_text(before)
         workspace = Workspace(self.root, True)
-        workspace.execute("replace_text", {"path": path.name, "old_text": before, "new_text": after})
+        workspace.execute("replace_text", {"path": path.name, "old_text": "'old'", "new_text": "'新'"})
+        self.assertEqual(workspace.edit.after, after)
         preview = workspace.edit.preview()
         self.assertIn("\n--- a/demo.py\n+++ b/demo.py\n@@", preview)
         self.assertIn("\n async def chat():\n-    model = 'old'\n+    model = '新'\n     return model", preview)
