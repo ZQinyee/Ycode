@@ -144,12 +144,13 @@ async def configured_chat():
         raise ValueError("YCODE_PROVIDER must be codex or ollama.")
     import httpx
 
+    url = urljoin(base_url or "http://127.0.0.1:11434", "/api/chat")
+    model = model or "qwen3:4b"
     async with httpx.AsyncClient(timeout=120) as client:
         async def chat(messages: list[dict], tools: list[dict]) -> ModelReply:
-            url = urljoin(base_url or "http://127.0.0.1:11434", "/api/chat")
             try:
                 response = await asyncio.wait_for(client.post(url, json={
-                    "model": model or "qwen3:4b", "messages": messages, "tools": tools, "stream": False,
+                    "model": model, "messages": messages, "tools": tools, "stream": False,
                 }), 120)
             except (asyncio.TimeoutError, httpx.TimeoutException) as error:
                 raise RuntimeError("Ollama did not respond within 120 seconds.") from error
@@ -158,6 +159,6 @@ async def configured_chat():
             data = response.json()
             usage = token_counts(input_tokens=data.get("prompt_eval_count"), output_tokens=data.get("eval_count"),
                                  cached_input_tokens=data.get("prompt_eval_cached_count"))
-            return ModelReply(data["message"], "ollama", usage, data.get("model") or model or "qwen3:4b")
+            return ModelReply(data["message"], "ollama", usage, data.get("model") or model)
 
         yield chat

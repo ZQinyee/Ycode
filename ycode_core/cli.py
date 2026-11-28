@@ -138,6 +138,12 @@ class Console:
             self.approval = None
 
     async def run(self, entry: dict | str):
+        if entry == "/exit":
+            self.quit.set()
+            return
+        if entry == "/cancel":
+            self.assistant.pending = None
+            return
         self.requests += 1
         task = asyncio.current_task()
         started = time.monotonic()
@@ -253,14 +259,7 @@ class Console:
                 self.wake.clear()
                 await self.wake.wait()
                 continue
-            entry = self.queue.popleft()
-            if entry == "/exit":
-                self.quit.set()
-                return
-            if entry == "/cancel":
-                self.assistant.pending = None
-                continue
-            self.foreground = asyncio.create_task(self.run(entry))
+            self.foreground = asyncio.create_task(self.run(self.queue.popleft()))
             await self.foreground
             self.foreground = None
 
@@ -275,13 +274,9 @@ class Console:
                 text = line.strip()
                 if not text:
                     continue
-                action = command(text)
-                if action == "/exit":
+                await self.run(command(text) or self.store.enqueue(text))
+                if self.quit.is_set():
                     break
-                if action == "/cancel":
-                    self.assistant.pending = None
-                    continue
-                await self.run(action or self.store.enqueue(text))
                 while self.queue:
                     await self.run(self.queue.popleft())
             return
