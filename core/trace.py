@@ -63,7 +63,7 @@ class Trace:
                 self.output = None
 
     def warn(self, error: Exception) -> None:
-        print(f"ycode: trace {self.run_id}: {error}", file=sys.stderr)
+        print(f"nuli: trace {self.run_id}: {error}", file=sys.stderr)
 
     @staticmethod
     def read_rates() -> dict:

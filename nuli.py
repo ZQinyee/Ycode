@@ -1,4 +1,4 @@
-from ycode_core.cli import main
+from core.cli import main
 
 
 if __name__ == "__main__":

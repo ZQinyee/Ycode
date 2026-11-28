@@ -14,20 +14,20 @@ from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 from uuid import uuid4
 
-from ycode_core.agent import Assistant, run_turn
-from ycode_core.cli import Console, command, show_preview
-from ycode_core.codex_agent import CodexAgent, CodexResult
-from ycode_core.git import apply_push, git, prepare_push
-from ycode_core.jobs import Jobs
-from ycode_core.memory import size
-from ycode_core.models import codex_usage
-from ycode_core.storage import Store, save_json
-from ycode_core.terminal import markdown_fragments
-from ycode_core.tools import Workspace
-from ycode_core.trace import Trace
+from core.agent import Assistant, run_turn
+from core.cli import Console, command, show_preview
+from core.codex_agent import CodexAgent, CodexResult
+from core.git import apply_push, git, prepare_push
+from core.jobs import Jobs
+from core.memory import size
+from core.models import codex_usage
+from core.storage import Store, save_json
+from core.terminal import markdown_fragments
+from core.tools import Workspace
+from core.trace import Trace
 
 
-CLI = Path(__file__).resolve().parents[1] / "ycode.py"
+CLI = Path(__file__).resolve().parents[1] / "nuli.py"
 
 
 def reply(content="", /, *, tool=None, **arguments):
@@ -41,7 +41,7 @@ def routed(action, **fields):
     return reply(json.dumps({"action": action, **fields}, ensure_ascii=False))
 
 
-class YcodeTests(unittest.IsolatedAsyncioTestCase):
+class NuliTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -114,7 +114,7 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(diff, "")
             return True
 
-        with patch("ycode_core.codex_agent.connect", connect), Trace(self.root).run("commit", "test") as trace:
+        with patch("core.codex_agent.connect", connect), Trace(self.root).run("commit", "test") as trace:
             result = await CodexAgent(self.root, True, approve).run("commit", trace, lambda _: None)
         self.assertEqual(seen[0][1]["sandbox"], "workspace-write")
         self.assertEqual(seen[0][1]["approvalPolicy"], "on-request")
@@ -136,7 +136,7 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
         async def connect(root):
             yield FakeRpc()
 
-        with patch("ycode_core.codex_agent.connect", connect), Trace(self.root).run("continue", "test") as trace:
+        with patch("core.codex_agent.connect", connect), Trace(self.root).run("continue", "test") as trace:
             result = await CodexAgent(self.root, False).run(
                 "continue", trace, lambda _: None, thread_id="native-thread", interrupted_turn="native-turn",
             )
@@ -316,7 +316,7 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
             return routed("new", title="Report", answer="First") if not tools else reply("Second")
 
         assistant = Assistant(self.store, chat)
-        with patch("ycode_core.storage.Turn.complete", side_effect=OSError("cleanup")):
+        with patch("core.storage.Turn.complete", side_effect=OSError("cleanup")):
             with self.assertRaisesRegex(OSError, "cleanup"):
                 await assistant.send("start", self.workspace)
         await assistant.send("继续 [Report]：more", self.workspace)

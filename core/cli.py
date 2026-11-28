@@ -175,7 +175,7 @@ class Console:
         if output:
             output.append(("", "\n"))
         waiting = self.approval is not None and not self.approval_has_draft
-        output.append(("", self.approval_prompt if waiting else "YCODE> "))
+        output.append(("", self.approval_prompt if waiting else "NULI> "))
         return FormattedText(output)
 
     def interrupt(self):
@@ -272,7 +272,7 @@ class Console:
                 print("GIT COMMAND STOPPED. TYPE /PUSH TO REVIEW." if entry == "/push"
                       else "REQUEST STOPPED. TYPE /RESUME TO CONTINUE.")
         except Exception as error:
-            print(f"ycode: {error}", file=sys.stderr)
+            print(f"nuli: {error}", file=sys.stderr)
         finally:
             self.running.pop(task, None)
             self.requests -= 1
@@ -303,7 +303,7 @@ class Console:
             try:
                 await coroutine
             except Exception as error:
-                print(f"ycode: {error}", file=sys.stderr)
+                print(f"nuli: {error}", file=sys.stderr)
 
         task = asyncio.create_task(report())
         self.background.add(task)
@@ -368,7 +368,7 @@ class Console:
             self.foreground = None
 
     async def interact(self):
-        print("YCODE · /EXIT TO QUIT")
+        print("NULI · /EXIT TO QUIT")
         if self.saved:
             print(f"SAVED {len(self.saved)} MESSAGES. TYPE /RESUME TO CONTINUE.")
             for item in self.saved[:3]:
@@ -467,7 +467,7 @@ async def run_cli(edit: bool, task: str):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="ycode", description="Run one task or open the interactive Ycode assistant.",
+        prog="nuli", description="Run one task or open the interactive Nuli assistant.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Interactive commands\n"
                "  /parallel TASK  Start an independent task\n"
@@ -476,7 +476,7 @@ def main() -> int:
                "  /stop JOB_ID   Stop a background command\n"
                "  /push          Review, commit, and push approved edits\n"
                "  /resume        Recover interrupted and queued requests\n"
-               "  /exit          Exit Ycode\n\n"
+               "  /exit          Exit Nuli\n\n"
                "YCODE_PROVIDER selects codex (default) or ollama.",
     )
     parser.add_argument("--edit", action="store_true", help="enable edits in the workspace")
@@ -487,6 +487,6 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as error:
-        print(f"ycode: {error}", file=sys.stderr)
+        print(f"nuli: {error}", file=sys.stderr)
         return 1
     return 0

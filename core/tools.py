@@ -55,7 +55,7 @@ class Edit:
                 output.write(self.after.encode("utf-8"))
             return
         if self.path.resolve() != self.path or read_text(self.path) != self.before:
-            raise ValueError("The file changed after the proposal. Run Ycode again to refresh it.")
+            raise ValueError("The file changed after the proposal. Run Nuli again to refresh it.")
         self.path.write_bytes(self.after.encode("utf-8"))
 
 
