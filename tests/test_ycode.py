@@ -21,7 +21,7 @@ from ycode_core.git import apply_push, git, prepare_push
 from ycode_core.jobs import Jobs
 from ycode_core.memory import size
 from ycode_core.models import codex_usage
-from ycode_core.storage import Store
+from ycode_core.storage import Store, save_json
 from ycode_core.terminal import markdown_fragments
 from ycode_core.tools import Workspace
 from ycode_core.trace import Trace
@@ -294,7 +294,7 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.store, "save_task", side_effect=OSError("disk full")):
             with self.assertRaisesRegex(OSError, "disk full"):
                 await Assistant(self.store, chat).send("Report", self.workspace)
-        with patch.object(self.store, "history", side_effect=AssertionError("full scan")):
+        with patch.object(self.store, "task_cards", side_effect=AssertionError("task lookup")):
             result = await Assistant(self.store, self.unexpected_chat).send(None, self.workspace)
         self.assertEqual(result["answer"], "Ready")
         self.assertEqual(len(result["task"]["history"]), 2)
@@ -398,6 +398,72 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["phase"] for event in continued if event["event"] == "model.started"],
                          ["answering"])
         self.assertEqual(continued[-1]["task_id"], first["task"]["id"])
+
+    def test_task_index_tracks_updates_and_rebuilds_from_task_files(self):
+        task = {"id": str(uuid4()), "title": "Report", "goal": "Write a report", "updatedAt": 1,
+                "artifacts": [], "history": [reply("Full report")]}
+        path = self.store.task_path(task["id"])
+        save_json(path, task)
+        card, = self.store.task_cards()
+        self.assertNotIn("history", card)
+
+        writer = Store(self.root)
+        writer.save_task({**task, "memory": {"through": 1, "text": "Report draft"}, "updatedAt": 2})
+        with patch.object(self.store, "_iter_tasks", side_effect=AssertionError("full scan")):
+            updated, = self.store.task_cards()
+        self.assertEqual((updated["summary"], updated["updatedAt"]), ("Report draft", 2))
+
+        # A task was written just before an interrupted process could update the cache.
+        save_json(path, {**task, "title": "Updated report"})
+        self.assertEqual(self.store.task_cards()[0]["title"], "Updated report")
+        self.store.index_path.write_text("invalid JSON", encoding="utf-8")
+        self.assertEqual(self.store.task_cards()[0]["title"], "Updated report")
+        self.assertEqual(writer.load_task(task["id"])["history"], task["history"])
+
+    async def test_routes_older_tasks_by_metadata_summary_and_history(self):
+        def task(title, updated, *, history=None, summary=None):
+            record = {"id": str(uuid4()), "title": title, "goal": title, "updatedAt": updated,
+                      "artifacts": [], "history": history or []}
+            if summary:
+                record["memory"] = {"through": 1, "text": summary}
+            self.store.save_task(record)
+            return record["id"]
+
+        travel = task("北海道札幌行程", 0)
+        summary = task("规划登山活动", 1, summary="约好下周去藻岩山。")
+        novel = task("写一篇言情小说", 2, history=[reply("这篇小说的男主是陈渡。")])
+        recent = [task(f"Report {index}", index) for index in range(3, 25)]
+        self.store.task_cards()
+
+        cases = [("札幌冬天适合去哪", travel, None), ("藻岩山后来怎么样了", summary, "藻岩山"),
+                 ("陈渡后来怎么样了", novel, "陈渡")]
+        for request, expected, keyword in cases:
+            async def chat(messages, tools):
+                if tools:
+                    return reply("Resumed the task")
+                payload = json.loads(messages[-1]["content"])
+                self.assertLessEqual(len(payload["tasks"]), 20)
+                self.assertEqual(payload["tasks"][0]["id"], expected)
+                self.assertIn(recent[-1], [card["id"] for card in payload["tasks"]])
+                if keyword:
+                    self.assertIn(keyword, payload["tasks"][0]["match"])
+                return routed("resume", id=expected)
+
+            with patch.object(self.store, "load_task", wraps=self.store.load_task) as load:
+                result = await Assistant(self.store, chat).send(request, self.workspace)
+            self.assertEqual(result["task"]["id"], expected)
+            loaded = {call.args[0] for call in load.call_args_list}
+            if expected == novel:
+                self.assertIn(recent[-1], loaded)
+            else:
+                self.assertEqual(loaded, {expected})
+
+        async def clarify(messages, tools):
+            return routed("clarify", question="你想接着聊哪项任务？")
+
+        with patch.object(self.store, "load_task", side_effect=AssertionError("history lookup")):
+            result = await Assistant(self.store, clarify).send("那个后来怎么样了", self.workspace)
+        self.assertEqual(result, {"question": "你想接着聊哪项任务？"})
 
     async def test_interrupted_request_stays_bound_to_its_task(self):
         report_id = str(uuid4())
