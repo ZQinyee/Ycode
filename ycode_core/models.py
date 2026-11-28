@@ -83,10 +83,15 @@ def codex_usage(events: bytes) -> dict[str, int]:
     return {}
 
 
-def codex() -> Chat:
+def codex_executable() -> str:
     executable = shutil.which("codex") or (str(BUNDLED_CODEX) if BUNDLED_CODEX.is_file() else None)
     if not executable:
         raise RuntimeError("Codex CLI not found. Install Codex and run codex login.")
+    return executable
+
+
+def codex() -> Chat:
+    executable = codex_executable()
     env = codex_environment()
 
     async def chat(messages: list[dict], tools: list[dict]) -> ModelReply:
@@ -133,10 +138,14 @@ def codex() -> Chat:
     return chat
 
 
+def configured_provider() -> str:
+    return os.getenv("YCODE_PROVIDER") or ("ollama" if os.getenv("YCODE_BASE_URL") or os.getenv("YCODE_MODEL") else "codex")
+
+
 @asynccontextmanager
 async def configured_chat():
     base_url, model = os.getenv("YCODE_BASE_URL"), os.getenv("YCODE_MODEL")
-    provider = os.getenv("YCODE_PROVIDER") or ("ollama" if base_url or model else "codex")
+    provider = configured_provider()
     if provider == "codex":
         yield codex()
         return

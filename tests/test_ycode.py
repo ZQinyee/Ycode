@@ -8,18 +8,22 @@ import sys
 import tempfile
 import threading
 import unittest
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
 from ycode_core.agent import Assistant, run_turn
-from ycode_core.cli import Console
+from ycode_core.cli import Console, command, show_preview
+from ycode_core.codex_agent import CodexAgent, CodexResult
+from ycode_core.git import apply_push, git, prepare_push
 from ycode_core.jobs import Jobs
 from ycode_core.memory import size
 from ycode_core.models import codex_usage
 from ycode_core.storage import Store
 from ycode_core.tools import Workspace
+from ycode_core.trace import Trace
 
 
 CLI = Path(__file__).resolve().parents[1] / "ycode.py"
@@ -47,6 +51,135 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
     def traces(self):
         return [[json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
                 for path in (self.root / ".ycode/runs").glob("*.jsonl")]
+
+    async def test_codex_task_resumes_the_same_native_session_after_restart(self):
+        async def router(messages, tools):
+            self.assertFalse(tools)
+            return routed("new", title="Edit")
+
+        calls = []
+
+        class Executor:
+            async def run(self, prompt, trace, progress, *, thread_id, interrupted_turn, checkpoint):
+                calls.append((prompt, thread_id, interrupted_turn))
+                checkpoint("native-thread", "native-turn")
+                return CodexResult("Native answer", "native-thread", ["changed.py"])
+
+        first = await Assistant(self.store, router, executor=Executor()).send("改代码", self.workspace)
+        second = await Assistant(Store(self.root), self.unexpected_chat, executor=Executor()).send("运行测试", self.workspace)
+        self.assertEqual(calls, [("改代码", None, None), ("运行测试", "native-thread", None)])
+        self.assertEqual(first["task"]["id"], second["task"]["id"])
+        self.assertEqual(second["task"]["codexThreadId"], "native-thread")
+        self.assertEqual(second["task"]["artifacts"], ["changed.py"])
+
+    async def test_codex_bridge_verifies_and_answers_a_native_approval(self):
+        seen = []
+        item = {"id": "cmd", "type": "commandExecution", "command": "git commit -m 'Finish task'",
+                "cwd": str(self.root), "status": "inProgress"}
+
+        class FakeRpc:
+            events = []
+
+            async def call(self, method, params):
+                seen.append((method, params))
+                if method == "thread/start":
+                    return {"thread": {"id": "native-thread"}}
+                self.events = [
+                    {"method": "item/started", "params": {"item": item, "turnId": "native-turn"}},
+                    {"id": 12, "method": "item/commandExecution/requestApproval",
+                     "params": {"itemId": "cmd", "threadId": "native-thread", "turnId": "native-turn"}},
+                    {"method": "item/completed", "params": {"item": {**item, "status": "completed"}}},
+                    {"method": "item/completed", "params": {"item": {"id": "answer", "type": "agentMessage",
+                                                                   "text": "Committed."}}},
+                    {"method": "turn/completed", "params": {"turn": {"id": "native-turn", "status": "completed"}}},
+                ]
+                return {"turn": {"id": "native-turn"}}
+
+            async def send(self, event):
+                seen.append(event)
+
+        @contextlib.asynccontextmanager
+        async def connect(root):
+            self.assertEqual(root, self.root)
+            yield FakeRpc()
+
+        async def approve(detail, diff):
+            self.assertIn(item["command"], detail)
+            self.assertIn(str(self.root), detail)
+            self.assertEqual(diff, "")
+            return True
+
+        with patch("ycode_core.codex_agent.connect", connect), Trace(self.root).run("commit", "test") as trace:
+            result = await CodexAgent(self.root, True, approve).run("commit", trace, lambda _: None)
+        self.assertEqual(seen[0][1]["sandbox"], "workspace-write")
+        self.assertEqual(seen[0][1]["approvalPolicy"], "on-request")
+        self.assertEqual(seen[2], {"id": 12, "result": {"decision": "accept"}})
+        self.assertEqual(result.answer, "Committed.")
+
+    async def test_codex_recovery_returns_completed_native_turn_without_replaying(self):
+        seen = []
+
+        class FakeRpc:
+            async def call(self, method, params):
+                seen.append(method)
+                return {"thread": {"id": "native-thread", "turns": [{
+                    "id": "native-turn", "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "The command already finished."}],
+                }]}}
+
+        @contextlib.asynccontextmanager
+        async def connect(root):
+            yield FakeRpc()
+
+        with patch("ycode_core.codex_agent.connect", connect), Trace(self.root).run("continue", "test") as trace:
+            result = await CodexAgent(self.root, False).run(
+                "continue", trace, lambda _: None, thread_id="native-thread", interrupted_turn="native-turn",
+            )
+        self.assertEqual(seen, ["thread/resume"])
+        self.assertEqual(result.answer, "The command already finished.")
+
+    async def test_push_uses_approved_files_and_preserves_other_staged_changes(self):
+        remote = self.root / "remote.git"
+        repo = self.root / "repo"
+        repo.mkdir()
+        await git(self.root, "init", "--bare", str(remote))
+        await git(repo, "init", "-b", "main")
+        await git(repo, "config", "user.name", "Ycode Test")
+        await git(repo, "config", "user.email", "ycode@example.invalid")
+        await git(repo, "config", "commit.gpgsign", "false")
+        await git(repo, "config", "core.hooksPath", str(self.root / "no-hooks"))
+        tracked, unrelated, created = (repo / name for name in ("edited.txt", "elsewhere.txt", "new.txt"))
+        tracked.write_text("initial\n")
+        unrelated.write_text("keep staged later\n")
+        await git(repo, "add", "--", tracked.name, unrelated.name)
+        await git(repo, "commit", "-m", "Initial")
+        await git(repo, "remote", "add", "origin", str(remote))
+        await git(repo, "push", "-u", "origin", "main")
+
+        tracked.write_text("approved\n")
+        created.write_text("new approved file\n")
+        unrelated.write_text("unrelated staged change\n")
+        await git(repo, "add", "--", unrelated.name)
+        approved = {path.name: sha256(path.read_bytes()).hexdigest() for path in (tracked, created)}
+        self.assertEqual(command("push 吧"), "/push")
+        plan = await prepare_push(repo, approved)
+        self.assertEqual(plan.message, "Apply Ycode edits")
+        self.assertIn("Push main to origin/main", plan.preview())
+        self.assertIn("+approved", plan.preview())
+        self.assertNotIn(unrelated.name, plan.preview())
+        self.assertEqual(await git(remote, "rev-parse", "refs/heads/main"), plan.head + "\n")
+
+        tracked.write_text("changed after review\n")
+        with self.assertRaisesRegex(ValueError, "changed after approval"):
+            await apply_push(repo, approved, plan)
+        self.assertEqual(await git(repo, "rev-parse", "HEAD"), plan.head + "\n")
+        tracked.write_text("approved\n")
+        commit = await apply_push(repo, approved, plan)
+        self.assertEqual(await git(remote, "rev-parse", "refs/heads/main"), commit + "\n")
+        self.assertEqual(await git(repo, "diff", "--cached", "--name-only"), unrelated.name + "\n")
+        self.assertEqual(await git(repo, "show", "HEAD:elsewhere.txt"), "keep staged later\n")
+        self.assertEqual(await git(repo, "show", "HEAD:new.txt"), "new approved file\n")
+        self.assertIsNone(await prepare_push(repo, approved))
 
     def long_task(self):
         history = []
@@ -350,12 +483,76 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(histories, {"写小说": ["写小说", "写小说已完成"],
                                      "总结 README": ["总结 README", "总结 README已完成"]})
 
-    async def test_model_tool_budget(self):
+    async def test_tool_budget_executes_partial_batch_and_returns_an_answer(self):
+        for name in ("first", "second", "skipped"):
+            (self.root / name).write_text(name)
+
+        async def chat(messages, tools):
+            if not tools:
+                self.assertTrue(any("tool-call budget is exhausted" in item["content"] for item in messages
+                                    if item["role"] == "system"))
+                self.assertEqual([item["content"] for item in messages if item["role"] == "tool"],
+                                 ["first", "second"])
+                self.assertEqual(len(messages[-2]["tool_calls"]), 1)
+                return reply("Reviewed two files")
+            if messages[-1]["role"] == "user":
+                return reply(tool="read_file", path="first")
+            batch = reply(tool="read_file", path="second")
+            batch["tool_calls"].extend(reply(tool="read_file", path="skipped")["tool_calls"])
+            return batch
+
+        entry = self.store.enqueue("inspect", new_task=True)
+        with patch.dict(os.environ, {"YCODE_MAX_TOOL_CALLS": "2"}):
+            result = await Assistant(self.store, chat).send(entry, self.workspace)
+        self.assertEqual(result["answer"], "Reviewed two files")
+        events, = self.traces()
+        budget = next(event for event in events if event["event"] == "tool.limit")
+        self.assertEqual((budget["limit"], budget["skipped"]), (2, 1))
+        self.assertEqual(events[-1]["status"], "ok")
+
+    async def test_models_cannot_execute_tools_after_the_budget(self):
         async def chat(messages, tools):
             return reply(tool="list_files", path=".")
 
-        with self.assertRaisesRegex(ValueError, "limit of 12"):
-            await run_turn("inspect", chat, self.workspace)
+        with patch.dict(os.environ, {"YCODE_MAX_TOOL_CALLS": "1"}):
+            with patch.object(self.workspace, "execute", wraps=self.workspace.execute) as execute:
+                with self.assertRaisesRegex(ValueError, "budget was exhausted"):
+                    await run_turn("inspect", chat, self.workspace)
+                execute.assert_called_once_with("list_files", {"path": "."})
+
+    async def test_edit_preview_uses_red_and_green_backgrounds_in_256_colors(self):
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.data_structures import Size
+        from prompt_toolkit.output import ColorDepth
+        from prompt_toolkit.output.vt100 import Vt100_Output
+
+        buffer = io.StringIO()
+        output = Vt100_Output(buffer, lambda: Size(rows=24, columns=80), default_color_depth=ColorDepth.DEPTH_8_BIT)
+        preview = "\nProposed change in \"note.txt\"\n--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-before\n+after"
+        with create_app_session(output=output), patch.object(sys.stdout, "isatty", return_value=True):
+            await show_preview("Ready for review.", preview)
+        self.assertIn(";48;5;52m-before", buffer.getvalue())
+        self.assertIn(";48;5;22m+after", buffer.getvalue())
+
+    def test_edit_preview_shows_line_diff_with_limited_context(self):
+        path = self.root / "demo.py"
+        before = "# Distant line\n\nimport httpx\n\nasync def chat():\n    model = 'old'\n    return model\n"
+        after = before.replace("'old'", "'新'")
+        path.write_text(before)
+        workspace = Workspace(self.root, True)
+        workspace.execute("replace_text", {"path": path.name, "old_text": before, "new_text": after})
+        preview = workspace.edit.preview()
+        self.assertIn("\n--- a/demo.py\n+++ b/demo.py\n@@", preview)
+        self.assertIn("\n async def chat():\n-    model = 'old'\n+    model = '新'\n     return model", preview)
+        self.assertNotIn("Distant line", preview)
+        self.assertEqual(path.read_text(), before)
+
+        creation = Workspace(self.root, True)
+        creation.execute("write_file", {"path": "plain.txt", "content": "text\x1b[2J"})
+        preview = creation.edit.preview()
+        self.assertIn("\n--- /dev/null\n+++ b/plain.txt", preview)
+        self.assertIn(r"+text\u001b[2J", preview)
+        self.assertIn(r"\ No newline at end of file", preview)
 
     def test_edits_require_approval_and_recheck_the_file(self):
         path = self.root / "note.txt"

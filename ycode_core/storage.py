@@ -166,6 +166,11 @@ class Store:
             notice = f"Edit outcome unconfirmed. Check {edit['path']} before requesting another edit."
         if result["id"] not in commits:
             task["history"].extend(result["messages"])
+            if "codexThreadId" in result:
+                task["codexThreadId"] = result["codexThreadId"]
+                for path in result.get("artifacts", []):
+                    if path not in task["artifacts"]:
+                        task["artifacts"].append(path)
             if edit:
                 path = edit["path"]
                 applied = edit["state"] == "applied"

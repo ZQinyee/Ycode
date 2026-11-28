@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from difflib import unified_diff
+from io import StringIO
 from pathlib import Path
 
 
@@ -31,12 +33,25 @@ class Edit:
     old_text: str | None = None
     before: str | None = None
 
+    def updated_text(self) -> str:
+        if self.before is None:
+            return self.new_text
+        return self.before.replace(self.old_text, self.new_text, 1)
+
     def preview(self) -> str:
-        lines = [f"\nProposed change in {json.dumps(self.relative_path, ensure_ascii=False)}"]
-        if self.old_text is not None:
-            lines.append(f"- {json.dumps(self.old_text, ensure_ascii=False)}")
-        lines.append(f"+ {json.dumps(self.new_text, ensure_ascii=False)}")
-        return "\n".join(lines)
+        lines = ["", f"Proposed change in {json.dumps(self.relative_path, ensure_ascii=False)}"]
+        before = StringIO(self.before or "", newline="\n").readlines()
+        after = StringIO(self.updated_text(), newline="\n").readlines()
+        source = "/dev/null" if self.before is None else f"a/{self.relative_path}"
+        for line in unified_diff(before, after, fromfile=source, tofile=f"b/{self.relative_path}", n=2):
+            lines.append(line.removesuffix("\n"))
+            if not line.endswith("\n"):
+                lines.append(r"\ No newline at end of file")
+        if self.before is None and not after:
+            lines.append("(new empty file)")
+        # Render the diff as text while keeping terminal control characters visible.
+        return "\n".join("".join(char if char.isprintable() or char == "\t" else f"\\u{ord(char):04x}"
+                                 for char in line) for line in lines)
 
     def apply(self) -> None:
         if self.before is None:
@@ -47,7 +62,7 @@ class Edit:
             return
         if self.path.resolve() != self.path or read_text(self.path) != self.before:
             raise ValueError("The file changed after the proposal. Run Ycode again to refresh it.")
-        self.path.write_bytes(self.before.replace(self.old_text, self.new_text, 1).encode("utf-8"))
+        self.path.write_bytes(self.updated_text().encode("utf-8"))
 
 
 class Workspace:

@@ -8,13 +8,16 @@ import signal
 import sys
 import time
 from collections import deque
+from hashlib import sha256
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from .agent import Assistant, review_change, run_turn
+from .codex_agent import CodexAgent
+from .git import apply_push, prepare_push
 from .jobs import Jobs
 from .memory import context_budget
-from .models import Chat, configured_chat
+from .models import Chat, configured_chat, configured_provider
 from .storage import Store
 from .tools import Edit, Workspace
 from .trace import Trace
@@ -25,14 +28,64 @@ STATUS = {
     "answering": ("ON IT", "PUTTING THE ANSWER TOGETHER", "STILL WORKING ON IT"),
     "listing": ("SCANNING THE FOLDER",), "reading": ("READING THE FILE",),
     "editing": ("DRAFTING THE CHANGE",), "tool": ("RUNNING A TOOL",),
+    "git": ("CHECKING GIT CHANGES",), "pushing": ("PUSHING GIT COMMIT",),
+    "code_command": ("CODEX IS RUNNING A COMMAND",), "code_edit": ("CODEX IS EDITING FILES",),
 }
 FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 QUEUE_STYLES = ("class:queue0", "class:queue1", "class:queue2", "class:queue3")
 EDIT_PROMPT = "APPLY THIS EDIT? [Y/N] "
+PUSH_PROMPT = "COMMIT AND PUSH? [Y/N] "
+CODEX_PROMPT = "ALLOW CODEX ACTION? [Y/N] "
 
 
-async def confirm_edit(edit: Edit, ask: Callable[[], Awaitable[bool]]) -> bool:
-    print(edit.preview())
+async def show_preview(answer: str, preview: str = "") -> None:
+    if not sys.stdout.isatty():
+        print(answer)
+        if preview:
+            print(preview)
+        return
+
+    from prompt_toolkit.application import get_app_session, in_terminal
+    from prompt_toolkit.formatted_text import FormattedText
+    from prompt_toolkit.output import ColorDepth
+    from prompt_toolkit.renderer import print_formatted_text
+    from prompt_toolkit.styles import Style
+    from prompt_toolkit.utils import get_cwidth
+
+    output = get_app_session().output
+    depth = output.get_default_color_depth()
+    removed, added = "#ffe4e6 bg:#44252c", "#d8f8e4 bg:#1c382e"
+    if depth == ColorDepth.DEPTH_4_BIT:
+        removed, added = "ansiwhite bg:ansired", "ansiblack bg:ansibrightgreen"
+    elif depth == ColorDepth.DEPTH_8_BIT:
+        removed, added = "#ffe4e6 bg:#5f0000", "#d8f8e4 bg:#005f00"
+    styles = Style.from_dict({
+        "file": "bold", "range": "ansibrightblack",
+        "removed": removed, "added": added,
+    })
+    fragments = FormattedText([("", answer + "\n")])
+    in_hunk = False
+    width = output.get_size().columns if depth != ColorDepth.DEPTH_1_BIT else 0
+    for line in preview.splitlines():
+        style = ""
+        if line.startswith("@@ "):
+            in_hunk = True
+            style = "class:range"
+        elif in_hunk and line.startswith(("-", "+")):
+            style = "class:removed" if line.startswith("-") else "class:added"
+            if width:
+                line = line.expandtabs()
+                line += " " * max(0, width - get_cwidth(line))
+        elif line.startswith("Proposed change in "):
+            style = "class:file"
+        fragments.extend(((style, line), ("", "\n")))
+
+    async with in_terminal():
+        print_formatted_text(output, fragments, styles, color_depth=depth)
+
+
+async def confirm_edit(edit: Edit, ask: Callable[[], Awaitable[bool]], *, answer: str) -> bool:
+    await show_preview(answer, edit.preview())
     if not await ask():
         return False
     edit.apply()
@@ -42,19 +95,23 @@ async def confirm_edit(edit: Edit, ask: Callable[[], Awaitable[bool]]) -> bool:
 
 def command(text: str) -> str | None:
     lowered = text.lower()
-    if lowered in ("/exit", "/cancel", "/resume"):
+    if lowered in ("/exit", "/cancel", "/resume", "/push"):
         return lowered
+    if re.fullmatch(r"push\s*吧?[。！!]?", lowered):
+        return "/push"
     if re.fullmatch(r"继续刚才没做完的(?:任务)?[。！!]?", text):
         return "/resume"
     return None
 
 
 class Console:
-    def __init__(self, root: Path, chat: Chat, allow_edit: bool):
+    def __init__(self, root: Path, chat: Chat, allow_edit: bool, *, delegate: bool = False):
         self.root = root
         self.allow_edit = allow_edit
         self.store = Store(root)
-        self.assistant = Assistant(self.store, chat, context_bytes=context_budget())
+        approval = self.approve_codex if sys.stdin.isatty() and sys.stdout.isatty() else None
+        executor = CodexAgent(root, allow_edit, approval) if delegate else None
+        self.assistant = Assistant(self.store, chat, context_bytes=context_budget(), executor=executor)
         self.jobs = Jobs(root)
         self.saved = self.store.queued()
         self.queue: deque = deque()
@@ -65,7 +122,9 @@ class Console:
         self.background: set[asyncio.Task] = set()
         self.review_lock = asyncio.Lock()
         self.approval: asyncio.Future | None = None
+        self.approval_prompt = EDIT_PROMPT
         self.approval_has_draft = False
+        self.approved_files: dict[str, str] = {}
         self.session = None
         self.queue_count = 0
         self.queue_changed_at = 0.0
@@ -86,10 +145,10 @@ class Console:
             label = phrases[int((now - changed) / 4) % len(phrases)]
             center = frame % (len(label) + 6) - 3
             output.append(("class:accent", FRAMES[frame % len(FRAMES)] + "  "))
+            output.append(("class:muted", f"{now - started:.1f}S  "))
             for index, char in enumerate(label):
                 distance = min(abs(index - center), 3)
                 output.append((f"class:glow{distance}", char))
-            output.append(("class:muted", f"  {now - started:.1f}S"))
         if len(self.running) > 1:
             output.append(("class:muted", "  │  " if output else ""))
             output.append(("", f"RUNNING {len(self.running)}"))
@@ -106,7 +165,7 @@ class Console:
         if output:
             output.append(("", "\n"))
         waiting = self.approval is not None and not self.approval_has_draft
-        output.append(("", EDIT_PROMPT if waiting else "YCODE> "))
+        output.append(("", self.approval_prompt if waiting else "YCODE> "))
         return FormattedText(output)
 
     def interrupt(self):
@@ -121,21 +180,47 @@ class Console:
 
     async def review(self, answer: str, title: str, edit: Edit | None) -> bool:
         self.running.pop(asyncio.current_task(), None)
-        print(f"[{title}] {answer}")
+        answer = f"[{title}] {answer}"
         if not edit:
+            print(answer)
             return False
         async with self.review_lock:
-            return await confirm_edit(edit, self.ask_approval)
+            applied = await confirm_edit(edit, self.ask_approval, answer=answer)
+            if applied:
+                self.approved_files[edit.relative_path] = sha256(edit.updated_text().encode("utf-8")).hexdigest()
+            return applied
 
-    async def ask_approval(self) -> bool:
+    async def ask_approval(self, prompt: str = EDIT_PROMPT) -> bool:
         if self.session is None or self.quit.is_set():
             return False
         self.approval_has_draft = bool(self.session.default_buffer.text)
+        self.approval_prompt = prompt
         self.approval = asyncio.get_running_loop().create_future()
         try:
             return await self.approval
         finally:
             self.approval = None
+
+    async def approve_codex(self, detail: str, diff: str) -> bool:
+        async with self.review_lock:
+            await show_preview(detail, diff)
+            return await self.ask_approval(CODEX_PROMPT)
+
+    async def push(self, progress: Callable[[str], None]) -> None:
+        async with self.review_lock:
+            progress("git")
+            plan = await prepare_push(self.root, self.approved_files)
+            if plan is None:
+                print("NO APPROVED CHANGES OR LOCAL COMMITS TO PUSH.")
+                return
+            progress("")
+            await show_preview(plan.preview())
+            prompt = PUSH_PROMPT if plan.files else "PUSH LOCAL COMMITS? [Y/N] "
+            if not await self.ask_approval(prompt):
+                return
+            progress("pushing")
+            commit = await apply_push(self.root, self.approved_files, plan)
+            print(f"Pushed {commit[:12]} to {plan.remote}/{plan.target.removeprefix('refs/heads/')}.")
 
     async def run(self, entry: dict | str):
         if entry == "/exit":
@@ -154,6 +239,9 @@ class Console:
             self.running[task] = stage, started, changed if previous == stage else time.monotonic()
 
         try:
+            if entry == "/push":
+                await self.push(progress)
+                return
             result = await self.assistant.send(None if entry == "/resume" else entry,
                                                Workspace(self.root, self.allow_edit), progress, self.review)
             if entry == "/resume":
@@ -168,11 +256,12 @@ class Console:
                 print(result["question"] + " (/CANCEL TO START OVER)")
             if result and "notice" in result:
                 print(result["notice"])
-            if result and "task" in result and self.session is not None:
+            if result and "task" in result and self.session is not None and not self.assistant.executor:
                 self.summary_queue[result["task"]["id"]] = None
         except asyncio.CancelledError:
             if not self.quit.is_set():
-                print("REQUEST STOPPED. TYPE /RESUME TO CONTINUE.")
+                print("GIT COMMAND STOPPED. TYPE /PUSH TO REVIEW." if entry == "/push"
+                      else "REQUEST STOPPED. TYPE /RESUME TO CONTINUE.")
         except Exception as error:
             print(f"ycode: {error}", file=sys.stderr)
         finally:
@@ -237,8 +326,14 @@ class Console:
                 print({"parallel": "USAGE /PARALLEL <TASK>", "bg": "USAGE /BG <COMMAND>",
                        "stop": "USAGE /STOP <JOB ID>"}[action])
             return
-        self.queue.append(command(text) or self.store.enqueue(text))
+        self.queue.append(self.entry(text))
         self.wake.set()
+
+    def entry(self, text: str) -> str | dict:
+        action = command(text)
+        if action == "/push" and self.assistant.executor:
+            return self.store.enqueue("push" if text.lower() == "/push" else text)
+        return action or self.store.enqueue(text)
 
     async def read_input(self):
         while not self.quit.is_set():
@@ -274,7 +369,7 @@ class Console:
                 text = line.strip()
                 if not text:
                     continue
-                await self.run(command(text) or self.store.enqueue(text))
+                await self.run(self.entry(text))
                 if self.quit.is_set():
                     break
                 while self.queue:
@@ -333,20 +428,32 @@ class Console:
 
 async def run_cli(edit: bool, task: str):
     root = Path.cwd().resolve()
+    delegate = configured_provider() == "codex"
     if not task:
         async with configured_chat() as chat:
-            await Console(root, chat, edit).interact()
+            await Console(root, chat, edit, delegate=delegate).interact()
         return
     with Trace(root).run(task, "one_shot") as trace:
+        if delegate:
+            async def approve(detail: str, diff: str) -> bool:
+                await show_preview(detail, diff)
+                return input(CODEX_PROMPT).strip().lower() == "y"
+
+            interactive = sys.stdin.isatty() and sys.stdout.isatty()
+            executor = CodexAgent(root, edit, approve if interactive else None)
+            result = await executor.run(task, trace, lambda _: None, ephemeral=True)
+            print(result.answer)
+            return
         tools = Workspace(root, edit)
         async with configured_chat() as chat:
             answer, _ = await run_turn(task, chat, tools, trace=trace)
-        print(answer)
         if tools.edit:
             async def ask() -> bool:
                 return sys.stdin.isatty() and sys.stdout.isatty() and input(EDIT_PROMPT).strip().lower() == "y"
 
-            await review_change(tools.edit, trace, lambda: confirm_edit(tools.edit, ask))
+            await review_change(tools.edit, trace, lambda: confirm_edit(tools.edit, ask, answer=answer))
+        else:
+            print(answer)
 
 
 def main() -> int:
@@ -358,11 +465,12 @@ def main() -> int:
                "  /bg COMMAND    Run a background command\n"
                "  /jobs          List background commands\n"
                "  /stop JOB_ID   Stop a background command\n"
+               "  /push          Review, commit, and push approved edits\n"
                "  /resume        Recover interrupted and queued requests\n"
                "  /exit          Exit Ycode\n\n"
                "YCODE_PROVIDER selects codex (default) or ollama.",
     )
-    parser.add_argument("--edit", action="store_true", help="preview file changes and request approval")
+    parser.add_argument("--edit", action="store_true", help="enable edits in the workspace")
     parser.add_argument("task", nargs="*", help="task to run once")
     args = parser.parse_args()
     try:
