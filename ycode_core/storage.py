@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -77,6 +78,10 @@ class Turn:
         self.record["task"] = {key: task[key] for key in ("id", "title")}
         save_json(self.path, self.record)
 
+    def checkpoint(self, result: dict) -> None:
+        self.record["result"] = result
+        save_json(self.path, self.record)
+
     def complete(self) -> None:
         self.path.unlink(missing_ok=True)
 
@@ -106,11 +111,76 @@ class Store:
                 continue
         return sorted(tasks, key=lambda task: task["updatedAt"], reverse=True)
 
-    def save_task(self, task: dict) -> None:
-        name = task["id"] + ".json"
+    def task_path(self, task_id: str) -> Path:
+        name = task_id + ".json"
         if not TASK_FILE.fullmatch(name):
             raise ValueError("Invalid task ID.")
-        save_json(self.tasks / name, task)
+        return self.tasks / name
+
+    def load_task(self, task_id: str) -> dict | None:
+        path = self.task_path(task_id)
+        if path.is_symlink():
+            raise ValueError("Expected a local task file.")
+        try:
+            return {**read_json(path), "id": task_id}
+        except FileNotFoundError:
+            return None
+
+    def save_task(self, task: dict) -> None:
+        save_json(self.task_path(task["id"]), task)
+
+    @contextmanager
+    def updating(self, fresh: dict, *, expected_revision: int | None = None):
+        """Load and validate a task while holding its cross-process commit lock."""
+        task_id = fresh["id"]
+        with self.lock(self.task_path(task_id).stem):
+            current = self.load_task(task_id) or fresh
+            if expected_revision is not None and len(current.get("turnIds", [])) != expected_revision:
+                raise RuntimeError("Task history changed in another request. Use /resume to retry.")
+            yield current
+
+    @contextmanager
+    def lock(self, name: str):
+        locks = local_directory(self.state / "locks")
+        # Keep the lock file in place. The OS releases ownership when its handle closes.
+        with (locks / name).open("a+b") as handle:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, PermissionError) as error:
+                raise RuntimeError("Task is busy in another request. Use /resume to retry.") from error
+            yield
+
+    def commit(self, turn: Turn, task: dict) -> dict:
+        """Commit the checkpoint under the task lock, including after a failed cleanup."""
+        result = turn.record["result"]
+        commits = task.setdefault("turnIds", [])
+        notice = None
+        edit = result.get("edit")
+        if edit and edit["state"] == "unknown":
+            notice = f"Edit outcome unconfirmed. Check {edit['path']} before requesting another edit."
+        if result["id"] not in commits:
+            task["history"].extend(result["messages"])
+            if edit:
+                path = edit["path"]
+                applied = edit["state"] == "applied"
+                note = "The user approved the file change and it was applied." if applied else "The proposed file change was not applied."
+                task["history"].append({"role": "system", "content": notice or f"{note} Path: {path}"})
+                if applied and path not in task["artifacts"]:
+                    task["artifacts"].append(path)
+            commits.append(result["id"])
+            task["updatedAt"] = timestamp()
+            self.save_task(task)
+        turn.complete()
+        response = {"answer": result["answer"], "task": task}
+        if notice:
+            response["notice"] = notice
+        return response
 
     def enqueue(self, request: str, new_task: bool = False) -> dict:
         self.last_queued_at = max(timestamp(), self.last_queued_at + 1)

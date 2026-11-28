@@ -9,13 +9,15 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
+from typing import Awaitable, Callable
 
-from .agent import Assistant, run_turn
+from .agent import Assistant, review_change, run_turn
 from .jobs import Jobs
+from .memory import context_budget
 from .models import Chat, configured_chat
 from .storage import Store
 from .tools import Edit, Workspace
-from .trace import Trace, span
+from .trace import Trace
 
 
 STATUS = {
@@ -27,6 +29,15 @@ STATUS = {
 FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 QUEUE_STYLES = ("class:queue0", "class:queue1", "class:queue2", "class:queue3")
 EDIT_PROMPT = "APPLY THIS EDIT? [Y/N] "
+
+
+async def confirm_edit(edit: Edit, ask: Callable[[], Awaitable[bool]]) -> bool:
+    print(edit.preview())
+    if not await ask():
+        return False
+    edit.apply()
+    print("Edit applied.")
+    return True
 
 
 def command(text: str) -> str | None:
@@ -43,7 +54,7 @@ class Console:
         self.root = root
         self.allow_edit = allow_edit
         self.store = Store(root)
-        self.assistant = Assistant(self.store, chat)
+        self.assistant = Assistant(self.store, chat, context_bytes=context_budget())
         self.jobs = Jobs(root)
         self.saved = self.store.queued()
         self.queue: deque = deque()
@@ -58,6 +69,9 @@ class Console:
         self.session = None
         self.queue_count = 0
         self.queue_changed_at = 0.0
+        self.requests = 0
+        self.summary_queue: dict[str, None] = {}
+        self.summary_worker: asyncio.Task | None = None
 
     def prompt(self):
         from prompt_toolkit.formatted_text import FormattedText
@@ -111,21 +125,20 @@ class Console:
         if not edit:
             return False
         async with self.review_lock:
-            print(edit.preview())
-            if self.session is None or self.quit.is_set():
-                return False
-            self.approval_has_draft = bool(self.session.default_buffer.text)
-            self.approval = asyncio.get_running_loop().create_future()
-            try:
-                accepted = await self.approval
-            finally:
-                self.approval = None
-            if accepted:
-                edit.apply()
-                print("Edit applied.")
-            return accepted
+            return await confirm_edit(edit, self.ask_approval)
+
+    async def ask_approval(self) -> bool:
+        if self.session is None or self.quit.is_set():
+            return False
+        self.approval_has_draft = bool(self.session.default_buffer.text)
+        self.approval = asyncio.get_running_loop().create_future()
+        try:
+            return await self.approval
+        finally:
+            self.approval = None
 
     async def run(self, entry: dict | str):
+        self.requests += 1
         task = asyncio.current_task()
         started = time.monotonic()
         self.running[task] = "", started, started
@@ -147,6 +160,10 @@ class Console:
                     print("NO UNFINISHED REQUEST")
             if result and "question" in result:
                 print(result["question"] + " (/CANCEL TO START OVER)")
+            if result and "notice" in result:
+                print(result["notice"])
+            if result and "task" in result and self.session is not None:
+                self.summary_queue[result["task"]["id"]] = None
         except asyncio.CancelledError:
             if not self.quit.is_set():
                 print("REQUEST STOPPED. TYPE /RESUME TO CONTINUE.")
@@ -154,6 +171,28 @@ class Console:
             print(f"ycode: {error}", file=sys.stderr)
         finally:
             self.running.pop(task, None)
+            self.requests -= 1
+            self.start_summary()
+
+    def start_summary(self) -> None:
+        if self.summary_worker or self.requests or self.queue or self.quit.is_set() or not self.summary_queue:
+            return
+        self.summary_worker = asyncio.create_task(self.summarize_queue())
+        self.summary_worker.add_done_callback(self.summary_finished)
+
+    async def summarize_queue(self) -> None:
+        while self.summary_queue and not (self.requests or self.queue or self.quit.is_set()):
+            task_id = next(iter(self.summary_queue))
+            self.summary_queue.pop(task_id)
+            try:
+                await self.assistant.summarize(task_id)
+            except Exception:
+                # The model failure is recorded in the trace. Retry after a later turn.
+                pass
+
+    def summary_finished(self, task: asyncio.Task) -> None:
+        self.summary_worker = None
+        self.start_summary()
 
     def launch(self, coroutine):
         async def report():
@@ -210,6 +249,7 @@ class Console:
     async def process_queue(self):
         while not self.quit.is_set():
             if not self.queue:
+                self.start_summary()
                 self.wake.clear()
                 await self.wake.wait()
                 continue
@@ -248,7 +288,6 @@ class Console:
 
         from prompt_toolkit import PromptSession
         from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.output import ColorDepth
         from prompt_toolkit.patch_stdout import patch_stdout
         from prompt_toolkit.styles import Style
 
@@ -264,8 +303,7 @@ class Console:
             "queue0": "bold ansiwhite", "queue1": "bold ansibrightcyan", "queue2": "ansibrightcyan", "queue3": "bold ansicyan",
             "glow0": "bold ansibrightcyan", "glow1": "ansibrightcyan", "glow2": "ansicyan", "glow3": "ansicyan dim",
         })
-        depth = ColorDepth.DEPTH_1_BIT if os.getenv("NO_COLOR") else None
-        self.session = PromptSession(key_bindings=keys, style=style, color_depth=depth)
+        self.session = PromptSession(key_bindings=keys, style=style)
         loop = asyncio.get_running_loop()
         signals = (signal.SIGTERM, signal.SIGHUP) if os.name == "posix" else ()
         for kind in signals:
@@ -281,6 +319,9 @@ class Console:
             finally:
                 self.quit.set()
                 self.wake.set()
+                summary_worker = self.summary_worker
+                if summary_worker:
+                    summary_worker.cancel()
                 if self.approval is not None and not self.approval.done():
                     self.approval.set_result(False)
                 for task in list(self.running):
@@ -288,6 +329,8 @@ class Console:
                 reader.cancel()
                 quit_waiter.cancel()
                 await asyncio.gather(reader, worker, quit_waiter, *self.background, return_exceptions=True)
+                if summary_worker:
+                    await asyncio.gather(summary_worker, return_exceptions=True)
                 await self.jobs.close()
                 for kind in signals:
                     loop.remove_signal_handler(kind)
@@ -305,13 +348,10 @@ async def run_cli(edit: bool, task: str):
             answer, _ = await run_turn(task, chat, tools, trace=trace)
         print(answer)
         if tools.edit:
-            with span(trace, "edit", **trace.edit_call, path=tools.edit.relative_path) as event:
-                print(tools.edit.preview())
-                approved = sys.stdin.isatty() and sys.stdout.isatty() and input(EDIT_PROMPT).strip().lower() == "y"
-                if approved:
-                    tools.edit.apply()
-                    print("Edit applied.")
-                event["applied"] = approved
+            async def ask() -> bool:
+                return sys.stdin.isatty() and sys.stdout.isatty() and input(EDIT_PROMPT).strip().lower() == "y"
+
+            await review_change(tools.edit, trace, lambda: confirm_edit(tools.edit, ask))
 
 
 def main() -> int:
