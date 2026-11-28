@@ -22,6 +22,7 @@ from ycode_core.jobs import Jobs
 from ycode_core.memory import size
 from ycode_core.models import codex_usage
 from ycode_core.storage import Store
+from ycode_core.terminal import markdown_fragments
 from ycode_core.tools import Workspace
 from ycode_core.trace import Trace
 
@@ -519,6 +520,27 @@ class YcodeTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ValueError, "budget was exhausted"):
                     await run_turn("inspect", chat, self.workspace)
                 execute.assert_called_once_with("list_files", {"path": "."})
+
+    def test_terminal_markdown_renders_tables_and_labelled_links(self):
+        from prompt_toolkit.utils import get_cwidth
+
+        answer = ("这是 **重点**。\n\n"
+                  "| 日期 | 行程 | 住宿 |\n| --- | --- | --- |\n"
+                  "| 第一天 | 抵达新千岁机场，然后搭车前往札幌 | 札幌 |\n\n"
+                  "1. 查看 [tools.py:29](/tmp/project/tools.py:29)。\n\n"
+                  "\x1b[2J")
+        parts = markdown_fragments(answer, 48, hyperlinks=True)
+        body = "".join(text for style, text in parts if style != "[ZeroWidthEscape]")
+        hidden = "".join(text for style, text in parts if style == "[ZeroWidthEscape]")
+        self.assertIn("重点", body)
+        self.assertIn("札幌", body)
+        self.assertIn("tools.py:29", body)
+        self.assertNotIn("/tmp/project", body)
+        self.assertNotIn("**", body)
+        self.assertNotIn("| ---", body)
+        self.assertNotIn("\x1b", body)
+        self.assertTrue(all(get_cwidth(line) <= 48 for line in body.splitlines()))
+        self.assertIn("file:///tmp/project/tools.py", hidden)
 
     async def test_edit_preview_uses_red_and_green_backgrounds_in_256_colors(self):
         from prompt_toolkit.application import create_app_session

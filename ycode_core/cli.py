@@ -38,9 +38,9 @@ PUSH_PROMPT = "COMMIT AND PUSH? [Y/N] "
 CODEX_PROMPT = "ALLOW CODEX ACTION? [Y/N] "
 
 
-async def show_preview(answer: str, preview: str = "") -> None:
+async def show_preview(answer: str, preview: str = "", *, title: str = "", markdown: bool = False) -> None:
     if not sys.stdout.isatty():
-        print(answer)
+        print(f"[{title}] {answer}" if title else answer)
         if preview:
             print(preview)
         return
@@ -54,6 +54,7 @@ async def show_preview(answer: str, preview: str = "") -> None:
 
     output = get_app_session().output
     depth = output.get_default_color_depth()
+    columns = output.get_size().columns
     removed, added = "#ffe4e6 bg:#44252c", "#d8f8e4 bg:#1c382e"
     if depth == ColorDepth.DEPTH_4_BIT:
         removed, added = "ansiwhite bg:ansired", "ansiblack bg:ansibrightgreen"
@@ -63,9 +64,18 @@ async def show_preview(answer: str, preview: str = "") -> None:
         "file": "bold", "range": "ansibrightblack",
         "removed": removed, "added": added,
     })
-    fragments = FormattedText([("", answer + "\n")])
+    fragments = FormattedText()
+    if title:
+        fragments.append(("bold #8fe3ed", f"[{title}]\n\n"))
+    if markdown:
+        from .terminal import markdown_fragments
+
+        fragments.extend(markdown_fragments(answer, columns, hyperlinks=depth != ColorDepth.DEPTH_1_BIT))
+        fragments.append(("", "\n"))
+    else:
+        fragments.append(("", answer + "\n"))
     in_hunk = False
-    width = output.get_size().columns if depth != ColorDepth.DEPTH_1_BIT else 0
+    width = columns if depth != ColorDepth.DEPTH_1_BIT else 0
     for line in preview.splitlines():
         style = ""
         if line.startswith("@@ "):
@@ -84,8 +94,8 @@ async def show_preview(answer: str, preview: str = "") -> None:
         print_formatted_text(output, fragments, styles, color_depth=depth)
 
 
-async def confirm_edit(edit: Edit, ask: Callable[[], Awaitable[bool]], *, answer: str) -> bool:
-    await show_preview(answer, edit.preview())
+async def confirm_edit(edit: Edit, ask: Callable[[], Awaitable[bool]], *, answer: str, title: str = "") -> bool:
+    await show_preview(answer, edit.preview(), title=title, markdown=True)
     if not await ask():
         return False
     edit.apply()
@@ -180,12 +190,11 @@ class Console:
 
     async def review(self, answer: str, title: str, edit: Edit | None) -> bool:
         self.running.pop(asyncio.current_task(), None)
-        answer = f"[{title}] {answer}"
         if not edit:
-            print(answer)
+            await show_preview(answer, title=title, markdown=True)
             return False
         async with self.review_lock:
-            applied = await confirm_edit(edit, self.ask_approval, answer=answer)
+            applied = await confirm_edit(edit, self.ask_approval, answer=answer, title=title)
             if applied:
                 self.approved_files[edit.relative_path] = sha256(edit.updated_text().encode("utf-8")).hexdigest()
             return applied
@@ -442,7 +451,7 @@ async def run_cli(edit: bool, task: str):
             interactive = sys.stdin.isatty() and sys.stdout.isatty()
             executor = CodexAgent(root, edit, approve if interactive else None)
             result = await executor.run(task, trace, lambda _: None, ephemeral=True)
-            print(result.answer)
+            await show_preview(result.answer, markdown=True)
             return
         tools = Workspace(root, edit)
         async with configured_chat() as chat:
@@ -453,7 +462,7 @@ async def run_cli(edit: bool, task: str):
 
             await review_change(tools.edit, trace, lambda: confirm_edit(tools.edit, ask, answer=answer))
         else:
-            print(answer)
+            await show_preview(answer, markdown=True)
 
 
 def main() -> int:
